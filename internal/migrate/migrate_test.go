@@ -3,7 +3,7 @@ package migrate
 import (
 	"testing"
 
-	"github.com/maddiesch/raptor/internal/test"
+	"github.com/angryboat/raptor/internal/test"
 	"github.com/stretchr/testify/assert"
 )
 

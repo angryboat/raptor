@@ -8,7 +8,7 @@ import (
 
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/maddiesch/raptor/internal/migrate"
+	"github.com/angryboat/raptor/internal/migrate"
 )
 
 func Setup(ctx context.Context, conn *pgx.Conn) error {

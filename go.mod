@@ -1,4 +1,4 @@
-module github.com/maddiesch/raptor
+module github.com/angryboat/raptor
 
 go 1.26.4
 
