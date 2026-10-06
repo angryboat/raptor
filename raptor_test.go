@@ -172,6 +172,53 @@ func TestRaptor(t *testing.T) {
 		assert.ErrorIs(t, err, ErrJobNotFound)
 	})
 
+	t.Run("Release", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue: "default",
+			Type:  "test.job",
+		})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+
+		require.NoError(t, Release(t.Context(), db, jobs[0]))
+
+		jobs, err = Claim(t.Context(), db, "default", "worker-2", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		assert.Equal(t, id, jobs[0].ID)
+		assert.Equal(t, int32(1), jobs[0].Attempts, "a released claim shouldn't count as an attempt")
+	})
+
+	t.Run("Release_StaleClaim", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		_, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue: "default",
+			Type:  "test.job",
+		})
+		require.NoError(t, err)
+
+		stale, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, stale, 1)
+
+		require.NoError(t, Release(t.Context(), db, stale[0]))
+
+		fresh, err := Claim(t.Context(), db, "default", "worker-2", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, fresh, 1)
+
+		assert.ErrorIs(t, Release(t.Context(), db, stale[0]), ErrClaimLost)
+
+		require.NoError(t, Complete(t.Context(), db, fresh[0]))
+		assert.ErrorIs(t, Release(t.Context(), db, fresh[0]), ErrJobNotFound)
+	})
+
 	t.Run("Sweep", func(t *testing.T) {
 		// Not tx-scoped like its siblings: Sweep's expiry check compares
 		// claimed_at against now(), and now() is pinned to the transaction's

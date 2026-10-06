@@ -281,6 +281,27 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE FUNCTION "raptor_release_job"(
+  p_job_id UUID,
+  p_worker_id VARCHAR(64),
+  p_attempt INT
+) RETURNS TEXT AS $$
+BEGIN
+  UPDATE "raptor_jobs"
+  SET "status" = 'pending',
+      "claimed_at" = NULL,
+      "claimed_by" = NULL,
+      "attempts" = "attempts" - 1
+  WHERE "id" = p_job_id AND "status" = 'claimed' AND "claimed_by" = p_worker_id AND "attempts" = p_attempt;
+
+  IF NOT FOUND THEN
+    RETURN "raptor_claim_miss"(p_job_id);
+  END IF;
+
+  RETURN 'RELEASED';
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE FUNCTION "raptor_cancel_job"(
   p_job_id UUID
 ) RETURNS BOOLEAN AS $$

@@ -242,6 +242,13 @@ func Fail(ctx context.Context, db DB, job *Job, failure error) error {
 	return settleClaim(ctx, db, `SELECT "raptor_fail_job"($1, $2, $3, $4)`, job.ID, job.ClaimedBy, job.Attempts, infoJSON)
 }
 
+// Release returns a claimed job that never started back to pending without
+// counting the claim as an attempt. It returns ErrClaimLost if the job was
+// reaped or reclaimed since job was claimed.
+func Release(ctx context.Context, db DB, job *Job) error {
+	return settleClaim(ctx, db, `SELECT "raptor_release_job"($1, $2, $3)`, job.ID, job.ClaimedBy, job.Attempts)
+}
+
 func settleClaim(ctx context.Context, db DB, query string, args ...any) error {
 	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
