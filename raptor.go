@@ -182,30 +182,24 @@ func Claim(ctx context.Context, db DB, queue, worker string, limit int, timeout 
 	return jobs, nil
 }
 
-var ErrJobNotFound = errors.New("raptor: job not found")
+var (
+	ErrJobNotFound = errors.New("raptor: job not found")
+	ErrClaimLost   = errors.New("raptor: job claim lost")
+)
 
-func Complete(ctx context.Context, db DB, jobID string) error {
-	rows, err := db.Query(ctx, `SELECT "raptor_complete_job"($1)`, jobID)
-	if err != nil {
-		return err
+// ClaimDeadline is when the job's claim expires and Sweep may hand it to
+// another worker.
+func (j *Job) ClaimDeadline() time.Time {
+	if j.ClaimedAt == nil {
+		return time.Time{}
 	}
-	defer rows.Close()
+	return j.ClaimedAt.Add(time.Duration(j.ClaimedTTL) * time.Second)
+}
 
-	var ok bool
-	if rows.Next() {
-		if err := rows.Scan(&ok); err != nil {
-			return err
-		}
-	}
-	if err := rows.Err(); err != nil {
-		return err
-	}
-
-	if !ok {
-		return ErrJobNotFound
-	}
-
-	return nil
+// Complete marks a claimed job as completed. It returns ErrClaimLost if the
+// job was reaped or reclaimed since job was claimed.
+func Complete(ctx context.Context, db DB, job *Job) error {
+	return settleClaim(ctx, db, `SELECT "raptor_complete_job"($1, $2, $3)`, job.ID, job.ClaimedBy, job.Attempts)
 }
 
 func Cancel(ctx context.Context, db DB, jobID string) error {
@@ -232,21 +226,24 @@ func Cancel(ctx context.Context, db DB, jobID string) error {
 	return nil
 }
 
-func Fail(ctx context.Context, db DB, jobID string, failure error) error {
-	var (
-		rows pgx.Rows
-		err  error
-	)
-
-	if failure == nil {
-		rows, err = db.Query(ctx, `SELECT "raptor_fail_job"($1)`, jobID)
-	} else {
-		info, marshalErr := json.Marshal(map[string]string{"error": failure.Error()})
-		if marshalErr != nil {
-			return marshalErr
-		}
-		rows, err = db.Query(ctx, `SELECT "raptor_fail_job"($1, $2)`, jobID, info)
+// Fail records a failed attempt of a claimed job, scheduling a retry or
+// moving it to the dead jobs once its attempts are exhausted. It returns
+// ErrClaimLost if the job was reaped or reclaimed since job was claimed.
+func Fail(ctx context.Context, db DB, job *Job, failure error) error {
+	var info any
+	if failure != nil {
+		info = map[string]string{"error": failure.Error()}
 	}
+	infoJSON, err := json.Marshal(info)
+	if err != nil {
+		return err
+	}
+
+	return settleClaim(ctx, db, `SELECT "raptor_fail_job"($1, $2, $3, $4)`, job.ID, job.ClaimedBy, job.Attempts, infoJSON)
+}
+
+func settleClaim(ctx context.Context, db DB, query string, args ...any) error {
+	rows, err := db.Query(ctx, query, args...)
 	if err != nil {
 		return err
 	}
@@ -262,8 +259,11 @@ func Fail(ctx context.Context, db DB, jobID string, failure error) error {
 		return err
 	}
 
-	if status == "NOT_FOUND" {
+	switch status {
+	case "NOT_FOUND":
 		return ErrJobNotFound
+	case "CLAIM_LOST":
+		return ErrClaimLost
 	}
 
 	return nil

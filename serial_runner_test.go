@@ -1,8 +1,10 @@
 package raptor
 
 import (
+	"context"
 	"errors"
 	"testing"
+	"time"
 
 	"github.com/maddiesch/raptor/internal/test"
 	"github.com/stretchr/testify/assert"
@@ -30,9 +32,9 @@ func TestSerialRunner(t *testing.T) {
 		assert.ElementsMatch(t, highIDs, got[:2], "high queue should be fully drained first")
 		assert.ElementsMatch(t, lowIDs, got[2:], "low queue should run only after high is empty")
 
-		for _, id := range append(append([]string{}, highIDs...), lowIDs...) {
-			err := Complete(t.Context(), db, id)
-			assert.ErrorIs(t, err, ErrJobNotFound, "job %s should already be completed by the runner", id)
+		for _, job := range worker.jobs() {
+			err := Complete(t.Context(), db, job)
+			assert.ErrorIs(t, err, ErrJobNotFound, "job %s should already be completed by the runner", job.ID)
 		}
 	})
 
@@ -72,6 +74,30 @@ func TestSerialRunner(t *testing.T) {
 
 		assert.Len(t, worker.ids(), 1)
 		assert.True(t, isDead(t, db, id))
+	})
+
+	t.Run("Execute_WorkerContextEndsWithClaim", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		_, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job"})
+		require.NoError(t, err)
+
+		var (
+			deadline    time.Time
+			hasDeadline bool
+			claimEnds   time.Time
+		)
+		worker := ValueWorkerFunc(func(ctx context.Context, job *Job, _ any) error {
+			deadline, hasDeadline = ctx.Deadline()
+			claimEnds = job.ClaimDeadline()
+			return nil
+		})
+		r := NewSerialRunner([]string{"default"}, map[string]Worker{"test.job": worker})
+
+		require.NoError(t, r.Execute(t.Context(), db))
+
+		require.True(t, hasDeadline)
+		assert.Equal(t, claimEnds, deadline)
 	})
 
 	t.Run("Execute_EmptyQueueList", func(t *testing.T) {

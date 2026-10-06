@@ -31,7 +31,7 @@ func TestLoadQueueStat(t *testing.T) {
 		db := test.CreateDB(t)
 		require.NoError(t, Setup(t.Context(), db))
 
-		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job"})
+		_, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job"})
 		require.NoError(t, err)
 
 		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
@@ -40,7 +40,7 @@ func TestLoadQueueStat(t *testing.T) {
 
 		time.Sleep(5 * time.Millisecond) // give total_duration_ms something nonzero to record
 
-		require.NoError(t, Complete(t.Context(), db, id))
+		require.NoError(t, Complete(t.Context(), db, jobs[0]))
 
 		stat, err := LoadQueueStat(t.Context(), db, "default")
 		require.NoError(t, err)
@@ -57,14 +57,14 @@ func TestLoadQueueStat(t *testing.T) {
 	t.Run("FailedRetry", func(t *testing.T) {
 		db := beginTx(t, conn)
 
-		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", MaxAttempts: 3})
+		_, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", MaxAttempts: 3})
 		require.NoError(t, err)
 
 		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 1)
 
-		require.NoError(t, Fail(t.Context(), db, id, errors.New("boom")))
+		require.NoError(t, Fail(t.Context(), db, jobs[0], errors.New("boom")))
 
 		stat, err := LoadQueueStat(t.Context(), db, "default")
 		require.NoError(t, err)
@@ -80,14 +80,14 @@ func TestLoadQueueStat(t *testing.T) {
 	t.Run("Dead", func(t *testing.T) {
 		db := beginTx(t, conn)
 
-		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", MaxAttempts: 1})
+		_, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", MaxAttempts: 1})
 		require.NoError(t, err)
 
 		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 1)
 
-		require.NoError(t, Fail(t.Context(), db, id, errors.New("boom")))
+		require.NoError(t, Fail(t.Context(), db, jobs[0], errors.New("boom")))
 
 		stat, err := LoadQueueStat(t.Context(), db, "default")
 		require.NoError(t, err)
@@ -131,8 +131,9 @@ func TestLoadQueueStat(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, jobs, 2)
 
-		require.NoError(t, Complete(t.Context(), db, idA))
-		require.NoError(t, Fail(t.Context(), db, idB, errors.New("boom")))
+		byID := map[string]*Job{jobs[0].ID: jobs[0], jobs[1].ID: jobs[1]}
+		require.NoError(t, Complete(t.Context(), db, byID[idA]))
+		require.NoError(t, Fail(t.Context(), db, byID[idB], errors.New("boom")))
 
 		stat, err := LoadQueueStat(t.Context(), db, "default")
 		require.NoError(t, err)
@@ -151,7 +152,7 @@ func TestLoadQueueStat(t *testing.T) {
 	t.Run("QueueIsolation", func(t *testing.T) {
 		db := beginTx(t, conn)
 
-		idA, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "queue-a", Type: "test.job"})
+		_, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "queue-a", Type: "test.job"})
 		require.NoError(t, err)
 		_, err = Enqueue(t.Context(), db, EnqueueJob{Queue: "queue-b", Type: "test.job"})
 		require.NoError(t, err)
@@ -159,7 +160,7 @@ func TestLoadQueueStat(t *testing.T) {
 		jobs, err := Claim(t.Context(), db, "queue-a", "worker-1", 1, time.Minute)
 		require.NoError(t, err)
 		require.Len(t, jobs, 1)
-		require.NoError(t, Complete(t.Context(), db, idA))
+		require.NoError(t, Complete(t.Context(), db, jobs[0]))
 
 		statA, err := LoadQueueStat(t.Context(), db, "queue-a")
 		require.NoError(t, err)
@@ -192,7 +193,7 @@ func TestLoadQueueStat(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, jobs, 1)
 
-			require.NoError(t, Complete(t.Context(), db, jobs[0].ID))
+			require.NoError(t, Complete(t.Context(), db, jobs[0]))
 		}
 
 		for range 2 {
@@ -203,7 +204,7 @@ func TestLoadQueueStat(t *testing.T) {
 			require.NoError(t, err)
 			require.Len(t, jobs, 1)
 
-			require.NoError(t, Fail(t.Context(), db, jobs[0].ID, errors.New("boom")))
+			require.NoError(t, Fail(t.Context(), db, jobs[0], errors.New("boom")))
 		}
 
 		stat, err := LoadQueueStat(t.Context(), db, "default")

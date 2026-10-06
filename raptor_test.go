@@ -99,10 +99,10 @@ func TestRaptor(t *testing.T) {
 		require.Len(t, jobs, 1)
 		require.Equal(t, id, jobs[0].ID)
 
-		err = Complete(t.Context(), db, id)
+		err = Complete(t.Context(), db, jobs[0])
 		require.NoError(t, err)
 
-		err = Complete(t.Context(), db, id)
+		err = Complete(t.Context(), db, jobs[0])
 		assert.ErrorIs(t, err, ErrJobNotFound)
 	})
 
@@ -136,7 +136,7 @@ func TestRaptor(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, jobs, 1)
 
-		err = Fail(t.Context(), db, id, errors.New("boom"))
+		err = Fail(t.Context(), db, jobs[0], errors.New("boom"))
 		require.NoError(t, err)
 
 		jobs, err = Claim(t.Context(), db, "default", "worker-2", 1, time.Minute)
@@ -156,18 +156,19 @@ func TestRaptor(t *testing.T) {
 		})
 		require.NoError(t, err)
 
-		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		claimed, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
 		require.NoError(t, err)
-		require.Len(t, jobs, 1)
+		require.Len(t, claimed, 1)
+		require.Equal(t, id, claimed[0].ID)
 
-		err = Fail(t.Context(), db, id, errors.New("boom"))
+		err = Fail(t.Context(), db, claimed[0], errors.New("boom"))
 		require.NoError(t, err)
 
-		jobs, err = Claim(t.Context(), db, "default", "worker-2", 1, time.Minute)
+		jobs, err := Claim(t.Context(), db, "default", "worker-2", 1, time.Minute)
 		require.NoError(t, err)
 		assert.Empty(t, jobs)
 
-		err = Fail(t.Context(), db, id, errors.New("boom again"))
+		err = Fail(t.Context(), db, claimed[0], errors.New("boom again"))
 		assert.ErrorIs(t, err, ErrJobNotFound)
 	})
 
@@ -197,10 +198,64 @@ func TestRaptor(t *testing.T) {
 		require.NoError(t, err)
 
 		// raptor_reap_stuck_jobs reschedules with a 30s retry delay, so the job
-		// isn't immediately reclaimable. Confirm the reap happened by checking it
-		// left the "claimed" status instead (Complete only succeeds on a claimed job).
-		err = Complete(t.Context(), db, id)
-		assert.ErrorIs(t, err, ErrJobNotFound)
+		// isn't immediately reclaimable. Confirm the reap happened by checking the
+		// original claim no longer holds it.
+		err = Complete(t.Context(), db, jobs[0])
+		assert.ErrorIs(t, err, ErrClaimLost)
+
+		var status string
+		err = db.QueryRow(t.Context(), `SELECT "status"::text FROM "raptor_jobs" WHERE "id" = $1`, id).Scan(&status)
+		require.NoError(t, err)
+		assert.Equal(t, "pending", status)
+	})
+
+	t.Run("StaleClaim", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:       "default",
+			Type:        "test.job",
+			MaxAttempts: 3,
+		})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		stale := jobs[0]
+
+		_, err = db.Exec(t.Context(), `SELECT "raptor_fail_job"($1, $2, $3, '{"error":"claim timeout"}'::jsonb)`, id, *stale.ClaimedBy, stale.Attempts)
+		require.NoError(t, err)
+
+		jobs, err = Claim(t.Context(), db, "default", "worker-2", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		fresh := jobs[0]
+		require.Equal(t, id, fresh.ID)
+
+		assert.ErrorIs(t, Complete(t.Context(), db, stale), ErrClaimLost)
+		assert.ErrorIs(t, Fail(t.Context(), db, stale, errors.New("late")), ErrClaimLost)
+
+		sameWorker := *fresh
+		sameWorker.Attempts = stale.Attempts
+		assert.ErrorIs(t, Complete(t.Context(), db, &sameWorker), ErrClaimLost, "attempts must fence a worker that reclaims its own job")
+
+		require.NoError(t, Complete(t.Context(), db, fresh))
+	})
+
+	t.Run("ClaimDeadline", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		_, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job"})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		require.NotNil(t, jobs[0].ClaimedAt)
+
+		assert.Equal(t, jobs[0].ClaimedAt.Add(time.Minute), jobs[0].ClaimDeadline())
+		assert.True(t, (&Job{}).ClaimDeadline().IsZero())
 	})
 
 	t.Run("Expired", func(t *testing.T) {
@@ -256,7 +311,7 @@ func TestRaptor(t *testing.T) {
 		require.Len(t, jobs, 1)
 		require.Equal(t, id, jobs[0].ID)
 
-		err = Complete(t.Context(), db, id)
+		err = Complete(t.Context(), db, jobs[0])
 		require.NoError(t, err)
 
 		err = Cleanup(t.Context(), db, "default")

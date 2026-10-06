@@ -175,9 +175,21 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
-CREATE FUNCTION "raptor_complete_job"(
+-- A fenced complete/fail missed; a still-active job means the caller's claim was reaped or reclaimed.
+CREATE FUNCTION "raptor_claim_miss"(
   p_job_id UUID
-) RETURNS BOOLEAN AS $$
+) RETURNS TEXT AS $$
+  SELECT CASE
+    WHEN EXISTS (SELECT 1 FROM "raptor_jobs" WHERE "id" = p_job_id AND "status" IN ('pending', 'claimed')) THEN 'CLAIM_LOST'
+    ELSE 'NOT_FOUND'
+  END;
+$$ LANGUAGE sql;
+
+CREATE FUNCTION "raptor_complete_job"(
+  p_job_id UUID,
+  p_worker_id VARCHAR(64),
+  p_attempt INT
+) RETURNS TEXT AS $$
 DECLARE
   v_queue VARCHAR(64);
   v_type VARCHAR(64);
@@ -186,7 +198,7 @@ BEGIN
   UPDATE "raptor_jobs"
   SET "status" = 'completed',
       "completed_at" = now()
-  WHERE "id" = p_job_id AND "status" = 'claimed'
+  WHERE "id" = p_job_id AND "status" = 'claimed' AND "claimed_by" = p_worker_id AND "attempts" = p_attempt
   RETURNING
     "queue_name",
     "job_type",
@@ -194,7 +206,7 @@ BEGIN
   INTO v_queue, v_type, v_duration_ms;
 
   IF NOT FOUND THEN
-    RETURN FALSE; -- Job not found or not in claimed status
+    RETURN "raptor_claim_miss"(p_job_id);
   END IF;
 
   UPDATE "raptor_job_stats"
@@ -204,12 +216,14 @@ BEGIN
 
   PERFORM "raptor_bump_stats"(p_total_completed => 1);
 
-  RETURN TRUE;
+  RETURN 'COMPLETED';
 END;
 $$ LANGUAGE plpgsql;
 
 CREATE FUNCTION "raptor_fail_job"(
   p_job_id UUID,
+  p_worker_id VARCHAR(64),
+  p_attempt INT,
   p_failure_info JSONB DEFAULT 'null'::jsonb,
   p_retry_delay_ms INT DEFAULT 0
 ) RETURNS TEXT AS $$
@@ -217,9 +231,11 @@ DECLARE
   v_job "raptor_jobs"%ROWTYPE;
   v_delay_ms BIGINT;
 BEGIN
-  SELECT * INTO v_job FROM "raptor_jobs" WHERE "id" = p_job_id AND "status" = 'claimed' FOR UPDATE;
+  SELECT * INTO v_job FROM "raptor_jobs"
+  WHERE "id" = p_job_id AND "status" = 'claimed' AND "claimed_by" = p_worker_id AND "attempts" = p_attempt
+  FOR UPDATE;
   IF NOT FOUND THEN
-    RETURN 'NOT_FOUND'; -- Job not found or not in claimed status
+    RETURN "raptor_claim_miss"(p_job_id);
   END IF;
 
   IF v_job.attempts >= v_job.max_attempts THEN
@@ -299,15 +315,15 @@ CREATE FUNCTION "raptor_reap_stuck_jobs"(
 ) RETURNS INT AS $$
 DECLARE
   v_reaped_count INT := 0;
-  v_id UUID;
+  v_job RECORD;
 BEGIN
-  FOR v_id IN
-    SELECT "id" FROM "raptor_jobs"
+  FOR v_job IN
+    SELECT "id", "claimed_by", "attempts" FROM "raptor_jobs"
     WHERE "status" = 'claimed' AND "claimed_at" <= now() - (claimed_ttl || ' seconds')::INTERVAL
       AND (p_queue IS NULL OR "queue_name" = p_queue)
     FOR UPDATE SKIP LOCKED
   LOOP
-    PERFORM "raptor_fail_job"(v_id, '{"error":"claim timeout"}'::jsonb, p_retry_delay_ms);
+    PERFORM "raptor_fail_job"(v_job.id, v_job.claimed_by, v_job.attempts, '{"error":"claim timeout"}'::jsonb, p_retry_delay_ms);
     v_reaped_count := v_reaped_count + 1;
   END LOOP;
 

@@ -174,17 +174,20 @@ func executeJob(ctx context.Context, db DB, worker Worker, job *Job) error {
 	defer func() {
 		panicErr := recover()
 		if panicErr != nil {
-			_ = Fail(ctx, db, job.ID, fmt.Errorf("panic while executing job: %v", panicErr))
+			_ = Fail(ctx, db, job, fmt.Errorf("panic while executing job: %v", panicErr))
 		}
 	}()
 
 	if worker == nil {
-		return Fail(ctx, db, job.ID, fmt.Errorf("no worker for job type %q", job.Type))
+		return Fail(ctx, db, job, fmt.Errorf("no worker for job type %q", job.Type))
 	}
 
-	err := worker.Execute(ctx, job)
+	jobCtx, cancel := context.WithDeadline(ctx, job.ClaimDeadline())
+	defer cancel()
+
+	err := worker.Execute(jobCtx, job)
 	if err != nil {
-		return Fail(ctx, db, job.ID, err)
+		return Fail(ctx, db, job, err)
 	}
-	return Complete(ctx, db, job.ID)
+	return Complete(ctx, db, job)
 }

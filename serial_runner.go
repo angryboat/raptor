@@ -56,7 +56,7 @@ func (r *SerialRunner) drainQueue(ctx context.Context, db DB, queue string) erro
 func (r *SerialRunner) runJob(ctx context.Context, db DB, job *Job) {
 	worker, ok := r.Workers[job.Type]
 	if !ok {
-		_ = Fail(ctx, db, job.ID, fmt.Errorf("raptor: no worker registered for job type %q", job.Type))
+		_ = Fail(ctx, db, job, fmt.Errorf("raptor: no worker registered for job type %q", job.Type))
 		return
 	}
 
