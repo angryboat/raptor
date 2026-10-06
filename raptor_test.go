@@ -180,6 +180,45 @@ func TestRaptor(t *testing.T) {
 		assert.ErrorIs(t, err, ErrJobNotFound)
 	})
 
+	t.Run("Expired", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		expiredID, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:     "expiry",
+			Type:      "test.job",
+			ExpiresAt: time.Now().Add(-time.Minute),
+		})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "expiry", "worker-1", 10, time.Minute)
+		require.NoError(t, err)
+		assert.Empty(t, jobs)
+
+		liveID, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:     "expiry",
+			Type:      "test.job",
+			ExpiresAt: time.Now().Add(time.Hour),
+		})
+		require.NoError(t, err)
+
+		require.NoError(t, Sweep(t.Context(), db, "expiry"))
+
+		var status, reason string
+		err = db.QueryRow(t.Context(), `SELECT "status"::text, "failure_info"->>'error' FROM "raptor_jobs" WHERE "id" = $1`, expiredID).Scan(&status, &reason)
+		require.NoError(t, err)
+		assert.Equal(t, "cancelled", status)
+		assert.Equal(t, "expired", reason)
+
+		stat, err := LoadQueueStat(t.Context(), db, "expiry")
+		require.NoError(t, err)
+		assert.Equal(t, uint64(1), stat.Jobs["test.job"].CancelledCount)
+
+		jobs, err = Claim(t.Context(), db, "expiry", "worker-1", 10, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		assert.Equal(t, liveID, jobs[0].ID)
+	})
+
 	t.Run("Cleanup", func(t *testing.T) {
 		db := beginTx(t, conn)
 

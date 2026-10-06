@@ -315,6 +315,42 @@ BEGIN
 END;
 $$ LANGUAGE plpgsql;
 
+CREATE FUNCTION "raptor_expire_jobs"(
+  p_queue VARCHAR(64) DEFAULT NULL
+) RETURNS INT AS $$
+DECLARE
+  v_expired_count INT;
+BEGIN
+  WITH "expired" AS (
+    UPDATE "raptor_jobs"
+    SET "status" = 'cancelled',
+        "cancelled_at" = now(),
+        "failure_info" = '{"error":"expired"}'::jsonb
+    WHERE "id" IN (
+      SELECT "id" FROM "raptor_jobs"
+      WHERE "status" = 'pending' AND "expires_at" IS NOT NULL AND "expires_at" <= now()
+        AND (p_queue IS NULL OR "queue_name" = p_queue)
+      FOR UPDATE SKIP LOCKED
+    )
+    RETURNING "queue_name", "job_type"
+  ), "per_type" AS (
+    SELECT "queue_name", "job_type", count(*) AS "n" FROM "expired" GROUP BY "queue_name", "job_type"
+  ), "bumped" AS (
+    UPDATE "raptor_job_stats" s
+    SET "cancelled_count" = s."cancelled_count" + pt."n"
+    FROM "per_type" pt
+    WHERE s."queue_name" = pt."queue_name" AND s."job_type" = pt."job_type"
+  )
+  SELECT COALESCE(sum("n"), 0) INTO v_expired_count FROM "per_type";
+
+  IF v_expired_count > 0 THEN
+    PERFORM "raptor_bump_stats"(p_total_cancelled => v_expired_count);
+  END IF;
+
+  RETURN v_expired_count;
+END;
+$$ LANGUAGE plpgsql;
+
 CREATE FUNCTION "raptor_cleanup_jobs"(
   p_queue VARCHAR(64) DEFAULT NULL,
   p_completed_retention INTERVAL DEFAULT '24 hours',

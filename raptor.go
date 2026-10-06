@@ -275,15 +275,15 @@ func Sweep(ctx context.Context, db DB, queue string) error {
 		q = queue
 	}
 
-	rows, err := db.Query(ctx, `SELECT "raptor_reap_stuck_jobs"($1)`, q)
+	rows, err := db.Query(ctx, `SELECT "raptor_reap_stuck_jobs"($1), "raptor_expire_jobs"($1)`, q)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 
 	if rows.Next() {
-		var reaped int32
-		if err := rows.Scan(&reaped); err != nil {
+		var reaped, expired int32
+		if err := rows.Scan(&reaped, &expired); err != nil {
 			return err
 		}
 	}
