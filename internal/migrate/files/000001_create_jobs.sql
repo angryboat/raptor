@@ -158,6 +158,7 @@ BEGIN
     WHERE j."queue_name" = p_queue
       AND j."status" = 'pending'
       AND j."visible_at" <= now()
+      AND (j."expires_at" IS NULL OR j."expires_at" > now())
     ORDER BY j."priority" DESC, j."visible_at" ASC
     FOR UPDATE SKIP LOCKED
     LIMIT p_limit
