@@ -255,6 +255,31 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 		}
 	})
 
+	t.Run("CancelRacingClaimReleasesJob", func(t *testing.T) {
+		for i := range 8 {
+			queue := fmt.Sprintf("run-cancel-racing-claim-%d", i)
+			ids := enqueueN(t, db, queue, 1)
+
+			worker := &recordingWorker{}
+			r := NewConcurrentWeightedRunner(map[string]int{queue: 1}, map[string]Worker{"test.job": worker})
+			r.Threads = 1
+			r.emptyCooldown = 10 * time.Millisecond
+
+			ctx, cancel := context.WithCancel(t.Context())
+			returned := make(chan struct{})
+			racing := &cancelAfterFirstClaimDB{DB: db, cancel: cancel, settled: returned}
+
+			err := func() error {
+				defer close(returned)
+				return r.Run(ctx, racing)
+			}()
+			require.NoError(t, err)
+
+			assert.Empty(t, worker.ids())
+			assert.Equal(t, jobState{Status: "pending", Attempts: 0}, readJobState(t, db, ids[0]))
+		}
+	})
+
 	t.Run("ParentCancelledWithCause", func(t *testing.T) {
 		r := NewConcurrentWeightedRunner(map[string]int{"run-parent-cause": 1}, nil)
 		r.Threads = 1

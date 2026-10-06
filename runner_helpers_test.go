@@ -170,3 +170,37 @@ type failingDB struct {
 func (d failingDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	return nil, d.err
 }
+
+type cancelAfterFirstClaimDB struct {
+	DB
+	cancel  context.CancelFunc
+	settled <-chan struct{}
+	once    sync.Once
+}
+
+func (d *cancelAfterFirstClaimDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	rows, err := d.DB.Query(ctx, sql, args...)
+	if err != nil {
+		return nil, err
+	}
+	return &closeHookRows{Rows: rows, onClose: func() { d.once.Do(d.cancelAndSettle) }}, nil
+}
+
+func (d *cancelAfterFirstClaimDB) cancelAndSettle() {
+	d.cancel()
+
+	select {
+	case <-d.settled:
+	case <-time.After(20 * time.Millisecond):
+	}
+}
+
+type closeHookRows struct {
+	pgx.Rows
+	onClose func()
+}
+
+func (r *closeHookRows) Close() {
+	r.Rows.Close()
+	r.onClose()
+}
