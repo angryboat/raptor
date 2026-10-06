@@ -3,6 +3,7 @@ package raptor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -252,5 +253,49 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 			}
 			assert.Equal(t, want, readJobState(t, db, id), "job %s", id)
 		}
+	})
+
+	t.Run("ParentCancelledWithCause", func(t *testing.T) {
+		r := NewConcurrentWeightedRunner(map[string]int{"run-parent-cause": 1}, nil)
+		r.Threads = 1
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancelCause(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		cancel(errors.New("shutting down"))
+		assert.NoError(t, <-done)
+	})
+
+	t.Run("ParentDeadlineExceeded", func(t *testing.T) {
+		r := NewConcurrentWeightedRunner(map[string]int{"run-parent-deadline": 1}, nil)
+		r.Threads = 1
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithTimeout(t.Context(), 20*time.Millisecond)
+		defer cancel()
+
+		assert.ErrorIs(t, r.Run(ctx, db), context.DeadlineExceeded)
+	})
+}
+
+func TestConcurrentWeightedRunner_Run_DequeueError(t *testing.T) {
+	t.Run("ReturnsClaimError", func(t *testing.T) {
+		want := errors.New("db is down")
+
+		r := NewConcurrentWeightedRunner(map[string]int{"default": 1}, nil)
+		r.Threads = 1
+
+		assert.ErrorIs(t, r.Run(t.Context(), failingDB{err: want}), want)
+	})
+
+	t.Run("ReturnsClaimErrorWrappingCanceled", func(t *testing.T) {
+		want := fmt.Errorf("claim: %w", context.Canceled)
+
+		r := NewConcurrentWeightedRunner(map[string]int{"default": 1}, nil)
+		r.Threads = 1
+
+		assert.ErrorIs(t, r.Run(t.Context(), failingDB{err: want}), want)
 	})
 }

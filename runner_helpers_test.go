@@ -162,3 +162,11 @@ func countClaimed(t testing.TB, db DB, queue string) int {
 
 	return n
 }
+
+type failingDB struct {
+	err error
+}
+
+func (d failingDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
+	return nil, d.err
+}

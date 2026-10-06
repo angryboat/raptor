@@ -36,8 +36,8 @@ func (c *ConcurrentWeightedRunner) Quiet() {
 	c.quiet.Store(true)
 }
 
-func (c *ConcurrentWeightedRunner) Run(ctx context.Context, db DB) error {
-	ctx, cancel := context.WithCancelCause(ctx)
+func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
+	ctx, cancel := context.WithCancelCause(parent)
 	defer cancel(nil)
 
 	jobs := make(chan *Job, c.Threads)
@@ -68,7 +68,10 @@ func (c *ConcurrentWeightedRunner) Run(ctx context.Context, db DB) error {
 	<-ctx.Done()
 	workers.Wait()
 
-	if err := context.Cause(ctx); !errors.Is(err, context.Canceled) {
+	if err := context.Cause(ctx); err != context.Cause(parent) {
+		return err
+	}
+	if err := parent.Err(); !errors.Is(err, context.Canceled) {
 		return err
 	}
 	return nil
