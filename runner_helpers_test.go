@@ -4,6 +4,7 @@ import (
 	"context"
 	"sync"
 	"testing"
+	"time"
 
 	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/require"
@@ -93,4 +94,71 @@ func isDead(t *testing.T, db DB, id string) bool {
 	defer rows.Close()
 
 	return rows.Next()
+}
+
+// blockingWorker reports each job it starts on started, then holds it until
+// unblock is closed. It returns its context's error, so a job whose context
+// was cancelled mid-execution is recorded as failed.
+type blockingWorker struct {
+	started chan *Job
+	unblock chan struct{}
+}
+
+func newBlockingWorker() *blockingWorker {
+	return &blockingWorker{
+		started: make(chan *Job, 16),
+		unblock: make(chan struct{}),
+	}
+}
+
+func (w *blockingWorker) Execute(ctx context.Context, job *Job) error {
+	w.started <- job
+	<-w.unblock
+
+	return ctx.Err()
+}
+
+func (w *blockingWorker) awaitStart(t testing.TB) *Job {
+	t.Helper()
+
+	select {
+	case job := <-w.started:
+		return job
+	case <-time.After(3 * time.Second):
+		t.Fatal("worker never started a job")
+		return nil
+	}
+}
+
+type jobState struct {
+	Status   string
+	Attempts int32
+}
+
+func readJobState(t testing.TB, db DB, id string) jobState {
+	t.Helper()
+
+	rows, err := db.Query(t.Context(), `SELECT "status"::text, "attempts" FROM "raptor_jobs" WHERE "id" = $1`, id)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	require.True(t, rows.Next(), "job %s not found", id)
+	var state jobState
+	require.NoError(t, rows.Scan(&state.Status, &state.Attempts))
+
+	return state
+}
+
+func countClaimed(t testing.TB, db DB, queue string) int {
+	t.Helper()
+
+	rows, err := db.Query(t.Context(), `SELECT count(*) FROM "raptor_jobs" WHERE "queue_name" = $1 AND "status" = 'claimed'`, queue)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	require.True(t, rows.Next())
+	var n int
+	require.NoError(t, rows.Scan(&n))
+
+	return n
 }

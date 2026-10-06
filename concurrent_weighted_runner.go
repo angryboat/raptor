@@ -7,6 +7,7 @@ import (
 	"log/slog"
 	"runtime"
 	"sort"
+	"sync"
 	"sync/atomic"
 	"time"
 )
@@ -36,51 +37,41 @@ func (c *ConcurrentWeightedRunner) Quiet() {
 }
 
 func (c *ConcurrentWeightedRunner) Run(ctx context.Context, db DB) error {
-	jobs := make(chan *Job, c.Threads)
-	defer close(jobs)
-
 	ctx, cancel := context.WithCancelCause(ctx)
 	defer cancel(nil)
 
+	jobs := make(chan *Job, c.Threads)
+
 	go func() {
-		for {
-			select {
-			case <-ctx.Done():
+		defer close(jobs)
+		for ctx.Err() == nil && !c.quiet.Load() {
+			if err := c.dequeue(ctx, db, jobs); err != nil {
+				cancel(err)
 				return
-			default:
-				if c.quiet.Load() {
-					return
-				}
-				if err := c.dequeue(ctx, db, jobs); err != nil {
-					cancel(err)
-					return
-				}
 			}
 		}
 	}()
 
-	for i := 0; i < c.Threads; i++ {
-		go func() {
-			for {
-				select {
-				case <-ctx.Done():
-					return
-				case job := <-jobs:
-					if job == nil {
-						return
-					}
-					c.execute(ctx, db, job)
+	var workers sync.WaitGroup
+	for range c.Threads {
+		workers.Go(func() {
+			for job := range jobs {
+				if ctx.Err() != nil {
+					c.release(ctx, db, job)
+					continue
 				}
+				c.execute(ctx, db, job)
 			}
-		}()
+		})
 	}
 
 	<-ctx.Done()
-	err := ctx.Err()
-	if errors.Is(err, context.Canceled) {
-		return nil
+	workers.Wait()
+
+	if err := context.Cause(ctx); !errors.Is(err, context.Canceled) {
+		return err
 	}
-	return err
+	return nil
 }
 
 // dequeue runs one weighted round: each queue in c.Queue is drained up to
@@ -150,9 +141,10 @@ func (c *ConcurrentWeightedRunner) drainQueue(ctx context.Context, db DB, name s
 			return claimed, nil
 		}
 
-		for _, job := range jobs {
+		for i, job := range jobs {
 			select {
 			case <-ctx.Done():
+				c.release(ctx, db, jobs[i:]...)
 				return claimed, ctx.Err()
 			case queue <- job:
 				claimed++
@@ -170,24 +162,48 @@ func (c *ConcurrentWeightedRunner) execute(ctx context.Context, db DB, job *Job)
 	}
 }
 
-func executeJob(ctx context.Context, db DB, worker Worker, job *Job) error {
-	defer func() {
-		panicErr := recover()
-		if panicErr != nil {
-			_ = Fail(ctx, db, job, fmt.Errorf("panic while executing job: %v", panicErr))
-		}
-	}()
-
-	if worker == nil {
-		return Fail(ctx, db, job, fmt.Errorf("no worker for job type %q", job.Type))
-	}
-
-	jobCtx, cancel := context.WithDeadline(ctx, job.ClaimDeadline())
+func (c *ConcurrentWeightedRunner) release(ctx context.Context, db DB, jobs ...*Job) {
+	ctx, cancel := settleContext(ctx)
 	defer cancel()
 
-	err := worker.Execute(jobCtx, job)
+	for _, job := range jobs {
+		if err := Release(ctx, db, job); err != nil {
+			slog.ErrorContext(ctx, "failed to release job", slog.String("job-id", job.ID), slog.String("job-type", job.Type), slog.String("queue", job.Queue), slog.String("runner-id", c.id), slog.Any("error", err))
+		}
+	}
+}
+
+const settleTimeout = 10 * time.Second
+
+func settleContext(ctx context.Context) (context.Context, context.CancelFunc) {
+	return context.WithTimeout(context.WithoutCancel(ctx), settleTimeout)
+}
+
+func executeJob(ctx context.Context, db DB, worker Worker, job *Job) error {
+	err := runWorker(ctx, worker, job)
+
+	ctx, cancel := settleContext(ctx)
+	defer cancel()
+
 	if err != nil {
 		return Fail(ctx, db, job, err)
 	}
 	return Complete(ctx, db, job)
+}
+
+func runWorker(ctx context.Context, worker Worker, job *Job) (err error) {
+	defer func() {
+		if r := recover(); r != nil {
+			err = fmt.Errorf("panic while executing job: %v", r)
+		}
+	}()
+
+	if worker == nil {
+		return fmt.Errorf("no worker for job type %q", job.Type)
+	}
+
+	ctx, cancel := context.WithDeadline(context.WithoutCancel(ctx), job.ClaimDeadline())
+	defer cancel()
+
+	return worker.Execute(ctx, job)
 }

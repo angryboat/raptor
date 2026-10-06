@@ -189,4 +189,68 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 
 		assert.Len(t, worker.ids(), 1)
 	})
+
+	t.Run("CancelDuringExecutionCompletesJob", func(t *testing.T) {
+		ids := enqueueN(t, db, "run-cancel-inflight", 1)
+
+		worker := newBlockingWorker()
+		r := NewConcurrentWeightedRunner(map[string]int{"run-cancel-inflight": 1}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		worker.awaitStart(t)
+		cancel()
+
+		select {
+		case <-done:
+			t.Fatal("Run returned before the in-flight job finished")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		close(worker.unblock)
+		require.NoError(t, <-done)
+
+		assert.Equal(t, jobState{Status: "completed", Attempts: 1}, readJobState(t, db, ids[0]))
+	})
+
+	t.Run("CancelReleasesUnstartedJobs", func(t *testing.T) {
+		const queue = "run-cancel-unstarted"
+		ids := enqueueN(t, db, queue, 3)
+
+		worker := newBlockingWorker()
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 10}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		started := worker.awaitStart(t)
+
+		// One job executing, one in the channel buffer, one held by drainQueue.
+		require.Eventually(t, func() bool {
+			return countClaimed(t, db, queue) == 3
+		}, 3*time.Second, 10*time.Millisecond, "runner never claimed every job")
+
+		cancel()
+		close(worker.unblock)
+		require.NoError(t, <-done)
+
+		for _, id := range ids {
+			want := jobState{Status: "pending", Attempts: 0}
+			if id == started.ID {
+				want = jobState{Status: "completed", Attempts: 1}
+			}
+			assert.Equal(t, want, readJobState(t, db, id), "job %s", id)
+		}
+	})
 }
