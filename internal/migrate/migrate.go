@@ -3,6 +3,7 @@ package migrate
 import (
 	"context"
 	"embed"
+	"errors"
 	"io/fs"
 	"log/slog"
 	"path/filepath"
@@ -14,7 +15,23 @@ import (
 //go:embed files/*.sql
 var fileFS embed.FS
 
-func Up(ctx context.Context, conn *pgx.Conn) error {
+const lockID int64 = 0x7261_7074_6f72
+
+// Up applies any pending migrations. Concurrent callers, including those in
+// other processes, are serialized by a Postgres advisory lock.
+func Up(ctx context.Context, conn *pgx.Conn) (err error) {
+	if _, err := conn.Exec(ctx, `SELECT pg_advisory_lock($1)`, lockID); err != nil {
+		return err
+	}
+	defer func() {
+		_, unlockErr := conn.Exec(context.WithoutCancel(ctx), `SELECT pg_advisory_unlock($1)`, lockID)
+		err = errors.Join(err, unlockErr)
+	}()
+
+	return up(ctx, conn)
+}
+
+func up(ctx context.Context, conn *pgx.Conn) error {
 	k, err := conn.Exec(ctx, `CREATE TABLE IF NOT EXISTS "raptor_migrations" ("key" VARCHAR(32) PRIMARY KEY, "run_at" TIMESTAMPTZ NOT NULL DEFAULT NOW());`)
 	if err != nil {
 		return err

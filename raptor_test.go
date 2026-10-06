@@ -2,6 +2,7 @@ package raptor
 
 import (
 	"errors"
+	"sync"
 	"testing"
 	"time"
 
@@ -9,6 +10,28 @@ import (
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
+
+func TestSetupPool_Concurrent(t *testing.T) {
+	pool := test.CreatePool(t)
+
+	n := int(pool.Config().MaxConns)
+	start := make(chan struct{})
+	errs := make([]error, n)
+
+	var wg sync.WaitGroup
+	for i := range n {
+		wg.Go(func() {
+			<-start
+			errs[i] = SetupPool(t.Context(), pool)
+		})
+	}
+	close(start)
+	wg.Wait()
+
+	for i, err := range errs {
+		assert.NoError(t, err, "setup %d", i)
+	}
+}
 
 func TestRaptor(t *testing.T) {
 	conn := test.CreateDB(t)
