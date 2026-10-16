@@ -51,19 +51,35 @@ return runner.Run(ctx, pool)
 
 `Run` blocks until `ctx` is cancelled, then finishes the jobs it's already
 running. Each round it takes up to a queue's weight in jobs, starting with the
-highest-weight queue. `SerialRunner` empties its queues one job at a time and
-then returns, which is handy for tests and scripts.
+highest-weight queue. It claims a job only when one of its `Threads` workers
+is free to start it, so a claim's deadline never runs out while the job waits
+in line. `Threads` defaults to the number of CPUs, and `Run` returns an error
+if it isn't positive. Don't change `Queue`, `Workers` or `Threads` while `Run`
+is running; it reads them without locking. `SerialRunner` empties its queues
+one job at a time and then returns, which is handy for tests and scripts.
+
+By default, shutdown waits as long as the slowest running job, up to its
+claim deadline. If the process is killed first, say by a Kubernetes
+termination grace period, the job stays claimed until `Sweep` reaps it, and
+that costs an attempt. Set `ShutdownTimeout` on either runner to bound the
+wait: once `ctx` is done and the timeout passes, the runner cancels the
+contexts of the jobs still running. A job that then returns an error is
+released back to pending without using an attempt; one that returns nil is
+completed. The trade-off is that interrupted jobs run again from the start, so
+they should be idempotent, and workers must return when their context ends,
+since the runner still waits for them. Leave room within the grace period for
+the runner to settle jobs after the timeout.
 
 ## Jobs
 
-- **Retries**: a worker that returns an error or panics fails the job. It
-  retries until it has used `MaxAttempts` (10 by default), then moves to
-  `raptor_dead_jobs`. Each retry backs off exponentially with jitter, starting
-  around a second and capped at an hour, so the default 10 attempts span about
-  4 to 9 minutes. An error that implements `RetryAfterError`, even wrapped,
-  picks its own delay instead, which suits rate limits that say when to come
-  back. Callers that settle jobs themselves get the same from `Fail`, or pass
-  an exact delay to `FailAfter`.
+- **Retries**: a worker that returns an error or panics fails the job, as does
+  a job whose type has no registered worker. It retries until it has used
+  `MaxAttempts` (10 by default), then moves to `raptor_dead_jobs`. Each retry
+  backs off exponentially with jitter, starting around a second and capped at
+  an hour, so the default 10 attempts span about 4 to 9 minutes. An error that
+  implements `RetryAfterError`, even wrapped, picks its own delay instead,
+  which suits rate limits that say when to come back. Callers that settle jobs
+  themselves get the same from `Fail`, or pass an exact delay to `FailAfter`.
 - **Delays and expiry**: `VisibleAt` holds a job back until that time.
   `ExpiresAt` cancels it if it hasn't run by then.
 - **Deduplication**: while a job with the same `IdempotencyKey`, queue and type

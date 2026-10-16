@@ -26,7 +26,7 @@ func TestConcurrentWeightedRunner_Dequeue(t *testing.T) {
 		r.Threads = 10 // larger than either weight, so batching can't hide an over-claim
 
 		jobs := make(chan *Job, 10)
-		err := r.dequeue(t.Context(), db, jobs)
+		err := r.dequeue(t.Context(), db, weightedQueues(r.Queue), newIdleWorkers(r.Threads), jobs)
 		require.NoError(t, err)
 		close(jobs)
 
@@ -48,7 +48,7 @@ func TestConcurrentWeightedRunner_Dequeue(t *testing.T) {
 		r.Threads = 4
 
 		jobs := make(chan *Job, 10)
-		err := r.dequeue(t.Context(), db, jobs)
+		err := r.dequeue(t.Context(), db, weightedQueues(r.Queue), newIdleWorkers(r.Threads), jobs)
 		require.NoError(t, err)
 		close(jobs)
 
@@ -68,7 +68,7 @@ func TestConcurrentWeightedRunner_Dequeue(t *testing.T) {
 
 		jobs := make(chan *Job, 1)
 		start := time.Now()
-		err := r.dequeue(t.Context(), db, jobs)
+		err := r.dequeue(t.Context(), db, weightedQueues(r.Queue), newIdleWorkers(1), jobs)
 		elapsed := time.Since(start)
 
 		require.NoError(t, err)
@@ -89,12 +89,30 @@ func TestConcurrentWeightedRunner_Dequeue(t *testing.T) {
 
 		jobs := make(chan *Job, 1)
 		start := time.Now()
-		err := r.dequeue(ctx, db, jobs)
+		err := r.dequeue(ctx, db, weightedQueues(r.Queue), newIdleWorkers(1), jobs)
 		elapsed := time.Since(start)
 
 		require.NoError(t, err)
 		assert.Less(t, elapsed, 1*time.Second, "context cancellation should interrupt the cooldown wait early")
 	})
+}
+
+func TestWeightedQueues(t *testing.T) {
+	got := weightedQueues(map[string]int{
+		"low":      1,
+		"critical": 5,
+		"b-mid":    3,
+		"a-mid":    3,
+		"off":      0,
+		"negative": -1,
+	})
+
+	assert.Equal(t, []weightedQueue{
+		{name: "critical", weight: 5},
+		{name: "a-mid", weight: 3},
+		{name: "b-mid", weight: 3},
+		{name: "low", weight: 1},
+	}, got)
 }
 
 // TestConcurrentWeightedRunner_Run shares one pool + migration across its
@@ -160,6 +178,39 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 
 		cancel()
 		require.NoError(t, <-done)
+		assert.Equal(t, missingWorkerFailure, deadFailure(t, db, id))
+	})
+
+	t.Run("QueueFrozenAtRun", func(t *testing.T) {
+		const queue = "run-frozen-default"
+		const late = "run-frozen-late"
+		enqueueN(t, db, queue, 1)
+		lateIDs := enqueueN(t, db, late, 1)
+
+		worker := &recordingWorker{}
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 1}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		require.Eventually(t, func() bool {
+			return len(worker.ids()) == 1
+		}, 2*time.Second, 10*time.Millisecond, "worker never ran the first job")
+
+		r.Queue[late] = 1
+
+		assert.Never(t, func() bool {
+			return len(worker.ids()) > 1
+		}, 200*time.Millisecond, 10*time.Millisecond, "runner picked up a queue added after Run started")
+
+		cancel()
+		require.NoError(t, <-done)
+		assert.Equal(t, jobState{Status: "pending", Attempts: 0}, readJobState(t, db, lateIDs[0]))
 	})
 
 	t.Run("WorkerError", func(t *testing.T) {
@@ -220,6 +271,124 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 		assert.Equal(t, jobState{Status: "completed", Attempts: 1}, readJobState(t, db, ids[0]))
 	})
 
+	t.Run("ShutdownTimeoutReleasesInFlightJob", func(t *testing.T) {
+		const timeout = 100 * time.Millisecond
+		ids := enqueueN(t, db, "run-shutdown-timeout", 1)
+
+		worker := newBlockingWorker()
+		r := NewConcurrentWeightedRunner(map[string]int{"run-shutdown-timeout": 1}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.ShutdownTimeout = timeout
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		worker.awaitStart(t)
+		cancel()
+		cancelled := time.Now()
+
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(3 * time.Second):
+			t.Fatal("Run never returned after the shutdown timeout")
+		}
+
+		assert.GreaterOrEqual(t, time.Since(cancelled), timeout)
+		assert.Equal(t, jobState{Status: "pending", Attempts: 0}, readJobState(t, db, ids[0]))
+	})
+
+	t.Run("ShutdownTimeoutCompletesJobFinishedInTime", func(t *testing.T) {
+		ids := enqueueN(t, db, "run-shutdown-in-time", 1)
+
+		worker := newBlockingWorker()
+		r := NewConcurrentWeightedRunner(map[string]int{"run-shutdown-in-time": 1}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.ShutdownTimeout = 5 * time.Second
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		worker.awaitStart(t)
+		cancel()
+		close(worker.unblock)
+		require.NoError(t, <-done)
+
+		assert.Equal(t, jobState{Status: "completed", Attempts: 1}, readJobState(t, db, ids[0]))
+	})
+
+	t.Run("ShutdownTimeoutFailsJobErroringBeforeTimeout", func(t *testing.T) {
+		ids := enqueueN(t, db, "run-shutdown-error", 1)
+
+		worker := newBlockingWorker()
+		worker.err = errors.New("boom")
+		r := NewConcurrentWeightedRunner(map[string]int{"run-shutdown-error": 1}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.ShutdownTimeout = 5 * time.Second
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		worker.awaitStart(t)
+		cancel()
+		close(worker.unblock)
+		require.NoError(t, <-done)
+
+		assert.Equal(t, jobState{Status: "pending", Attempts: 1}, readJobState(t, db, ids[0]))
+	})
+
+	t.Run("NegativeShutdownTimeout", func(t *testing.T) {
+		const queue = "run-shutdown-negative"
+		enqueueN(t, db, queue, 1)
+
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 1}, nil)
+		r.ShutdownTimeout = -time.Second
+
+		assert.EqualError(t, r.Run(t.Context(), db), "raptor: shutdown timeout -1s must not be negative")
+		assert.Zero(t, countClaimed(t, db, queue))
+	})
+
+	t.Run("ClaimsNoMoreThanIdleWorkers", func(t *testing.T) {
+		const queue = "run-claims-idle"
+		const threads = 2
+		enqueueN(t, db, queue, 3*threads)
+
+		worker := newBlockingWorker()
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 10}, map[string]Worker{"test.job": worker})
+		r.Threads = threads
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		for range threads {
+			worker.awaitStart(t)
+		}
+
+		assert.Never(t, func() bool {
+			return countClaimed(t, db, queue) > threads
+		}, 200*time.Millisecond, 10*time.Millisecond, "runner claimed jobs no worker was free to start")
+
+		cancel()
+		close(worker.unblock)
+		require.NoError(t, <-done)
+	})
+
 	t.Run("CancelReleasesUnstartedJobs", func(t *testing.T) {
 		const queue = "run-cancel-unstarted"
 		ids := enqueueN(t, db, queue, 3)
@@ -236,11 +405,7 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 		go func() { done <- r.Run(ctx, db) }()
 
 		started := worker.awaitStart(t)
-
-		// One job executing, one in the channel buffer, one held by drainQueue.
-		require.Eventually(t, func() bool {
-			return countClaimed(t, db, queue) == 3
-		}, 3*time.Second, 10*time.Millisecond, "runner never claimed every job")
+		require.Equal(t, 1, countClaimed(t, db, queue), "only the running job should be claimed")
 
 		cancel()
 		close(worker.unblock)
@@ -303,6 +468,22 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 
 		assert.ErrorIs(t, r.Run(ctx, db), context.DeadlineExceeded)
 	})
+	for name, threads := range map[string]int{"ZeroThreads": 0, "NegativeThreads": -1} {
+		t.Run(name, func(t *testing.T) {
+			queue := "run-threads-" + name
+			enqueueN(t, db, queue, 1)
+
+			r := NewConcurrentWeightedRunner(map[string]int{queue: 1}, nil)
+			r.Threads = threads
+			r.emptyCooldown = 10 * time.Millisecond
+
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+
+			assert.EqualError(t, r.Run(ctx, db), fmt.Sprintf("raptor: runner threads %d must be positive", threads))
+			assert.Zero(t, countClaimed(t, db, queue))
+		})
+	}
 }
 
 func TestConcurrentWeightedRunner_Run_DequeueError(t *testing.T) {
