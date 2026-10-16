@@ -102,8 +102,8 @@ func TestLoad(t *testing.T) {
 		db := beginTx(t, conn)
 
 		exec(t, db, `INSERT INTO "raptor_stats" ("date", "span", "total_jobs") VALUES
-			(CURRENT_DATE - 400, 'day', 100),
-			(CURRENT_DATE, 'day', 5),
+			((now() AT TIME ZONE 'UTC')::date - 400, 'day', 100),
+			((now() AT TIME ZONE 'UTC')::date, 'day', 5),
 			(DATE '1970-01-01', 'all_time', 105)`)
 		_, err := raptor.Enqueue(t.Context(), db, raptor.EnqueueJob{Queue: "mail", Type: "mail.send"})
 		require.NoError(t, err)
@@ -117,6 +117,35 @@ func TestLoad(t *testing.T) {
 			{Label: "This month", Enqueued: 6},
 			{Label: "All time", Enqueued: 106},
 		}, snap.Totals)
+	})
+
+	t.Run("WindowsUseUTCDaysInEverySessionZone", func(t *testing.T) {
+		db := beginTx(t, conn)
+		zones := []string{"Pacific/Kiritimati", "Pacific/Pago_Pago"}
+
+		for _, zone := range zones {
+			setTimeZone(t, db, zone)
+			_, err := raptor.Enqueue(t.Context(), db, raptor.EnqueueJob{Queue: "mail", Type: "mail.send"})
+			require.NoError(t, err)
+		}
+
+		want := []totals{
+			{Label: "Today", Enqueued: 2},
+			{Label: "This week", Enqueued: 2},
+			{Label: "This month", Enqueued: 2},
+			{Label: "All time", Enqueued: 2},
+		}
+		for _, rollup := range []bool{false, true} {
+			if rollup {
+				require.NoError(t, raptor.Cleanup(t.Context(), db, ""))
+			}
+			for _, zone := range zones {
+				setTimeZone(t, db, zone)
+				snap, err := load(t.Context(), db)
+				require.NoError(t, err)
+				assert.Equal(t, want, snap.Totals, "read in %s, rolled up: %v", zone, rollup)
+			}
+		}
 	})
 
 	t.Run("Overdue", func(t *testing.T) {
@@ -350,6 +379,13 @@ func exec(t *testing.T, db pgx.Tx, sql string) {
 	t.Helper()
 
 	_, err := db.Exec(t.Context(), sql)
+	require.NoError(t, err)
+}
+
+func setTimeZone(t *testing.T, db pgx.Tx, zone string) {
+	t.Helper()
+
+	_, err := db.Exec(t.Context(), `SELECT set_config('TimeZone', $1, true)`, zone)
 	require.NoError(t, err)
 }
 

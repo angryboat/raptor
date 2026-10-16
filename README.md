@@ -135,7 +135,9 @@ totals. Counts are exact either way, but reading them gets slower the longer
 
 `dashboard.New` returns an `http.Handler` that renders a read-only page of
 queue depths and lifetime counts, running, retrying and dead jobs, and each
-schedule's next run. Turn on its Live toggle to refresh every 5 seconds. It
+schedule's next run. Its throughput counts for today, this week (starting
+Monday) and this month use UTC days, whatever time zone the database or each
+connection is set to. Turn on its Live toggle to refresh every 5 seconds. It
 does no authentication, so wrap it in your own middleware.
 
 ```go

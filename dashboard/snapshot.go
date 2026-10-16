@@ -117,9 +117,9 @@ const totalsQuery = `
 		coalesce(sum(s."total_failed"), 0)::bigint, coalesce(sum(s."total_cancelled"), 0)::bigint,
 		coalesce(sum(s."total_dead"), 0)::bigint
 	FROM (VALUES
-		(1, 'Today', CURRENT_DATE),
-		(2, 'This week', date_trunc('week', now())::date),
-		(3, 'This month', date_trunc('month', now())::date),
+		(1, 'Today', (now() AT TIME ZONE 'UTC')::date),
+		(2, 'This week', date_trunc('week', now() AT TIME ZONE 'UTC')::date),
+		(3, 'This month', date_trunc('month', now() AT TIME ZONE 'UTC')::date),
 		(4, 'All time', NULL)
 	) AS p("ord", "label", "since")
 	LEFT JOIN (

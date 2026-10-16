@@ -64,18 +64,53 @@ func TestStatsRollup(t *testing.T) {
 		require.NoError(t, err)
 		require.NoError(t, Cleanup(t.Context(), db, ""))
 
-		rows, err := db.Query(t.Context(), `SELECT "span", "date" = CURRENT_DATE, "total_jobs" FROM "raptor_stats" ORDER BY "span"`)
-		require.NoError(t, err)
-		type statRow struct {
-			Span  string
-			Today bool
-			Jobs  int64
-		}
-		got, err := pgx.CollectRows(rows, pgx.RowToStructByPos[statRow])
-		require.NoError(t, err)
-
-		assert.Equal(t, []statRow{{"all_time", false, 1}, {"day", true, 1}}, got)
+		assert.Equal(t, []statRow{{"all_time", false, 1}, {"day", true, 1}}, statRows(t, db))
 	})
+
+	t.Run("BucketsByUTCDayInEverySessionZone", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		for _, zone := range []string{"Pacific/Kiritimati", "Pacific/Pago_Pago"} {
+			setTimeZone(t, db, zone)
+			_, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job"})
+			require.NoError(t, err)
+		}
+
+		rows, err := db.Query(t.Context(), `SELECT "date" = (now() AT TIME ZONE 'UTC')::date FROM "raptor_stat_events"`)
+		require.NoError(t, err)
+		eventsToday, err := pgx.CollectRows(rows, pgx.RowTo[bool])
+		require.NoError(t, err)
+		assert.Equal(t, []bool{true, true}, eventsToday)
+
+		require.NoError(t, Cleanup(t.Context(), db, ""))
+
+		assert.Equal(t, []statRow{{"all_time", false, 2}, {"day", true, 2}}, statRows(t, db))
+	})
+}
+
+type statRow struct {
+	Span  string
+	Today bool
+	Jobs  int64
+}
+
+func statRows(t testing.TB, db DB) []statRow {
+	t.Helper()
+
+	rows, err := db.Query(t.Context(), `SELECT "span", "date" = (now() AT TIME ZONE 'UTC')::date, "total_jobs" FROM "raptor_stats" ORDER BY "span"`)
+	require.NoError(t, err)
+
+	got, err := pgx.CollectRows(rows, pgx.RowToStructByPos[statRow])
+	require.NoError(t, err)
+
+	return got
+}
+
+func setTimeZone(t testing.TB, db pgx.Tx, zone string) {
+	t.Helper()
+
+	_, err := db.Exec(t.Context(), `SELECT set_config('TimeZone', $1, true)`, zone)
+	require.NoError(t, err)
 }
 
 func TestStatsContention(t *testing.T) {
