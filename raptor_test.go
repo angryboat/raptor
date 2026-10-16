@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -556,35 +557,45 @@ func TestRaptor(t *testing.T) {
 
 	t.Run("Enqueue_KeyNeverFree", func(t *testing.T) {
 		db := beginTx(t, conn)
-
-		_, err := db.Exec(t.Context(), `
-			CREATE FUNCTION "raptor_test_take_key"() RETURNS TRIGGER AS $$
-			BEGIN
-				IF pg_trigger_depth() = 1 THEN
-					INSERT INTO "raptor_jobs" ("queue_name", "job_type", "idempotency_key") VALUES ('default', 'test.job', 'taken-key');
-				END IF;
-				RETURN NULL;
-			END;
-			$$ LANGUAGE plpgsql;
-			CREATE FUNCTION "raptor_test_free_key"() RETURNS TRIGGER AS $$
-			BEGIN
-				IF pg_trigger_depth() = 1 THEN
-					UPDATE "raptor_jobs" SET "status" = 'completed', "completed_at" = now()
-					WHERE "idempotency_key" = 'taken-key' AND "status" = 'pending';
-				END IF;
-				RETURN NULL;
-			END;
-			$$ LANGUAGE plpgsql;
-			CREATE TRIGGER "raptor_test_take_key" BEFORE INSERT ON "raptor_jobs"
-			FOR EACH STATEMENT EXECUTE FUNCTION "raptor_test_take_key"();
-			CREATE TRIGGER "raptor_test_free_key" AFTER INSERT ON "raptor_jobs"
-			FOR EACH STATEMENT EXECUTE FUNCTION "raptor_test_free_key"();`)
-		require.NoError(t, err)
+		keepStealingKey(t, db, "default", "test.job", "taken-key")
 
 		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", IdempotencyKey: "taken-key"})
 		assert.ErrorIs(t, err, errEnqueueMissed)
 		assert.Empty(t, id)
 	})
+}
+
+func keepStealingKey(t testing.TB, db pgx.Tx, queue, jobType, key string) {
+	t.Helper()
+
+	_, err := db.Exec(t.Context(), fmt.Sprintf(`
+		CREATE FUNCTION "raptor_test_take_key"() RETURNS TRIGGER AS $$
+		BEGIN
+			IF pg_trigger_depth() = 1 THEN
+				INSERT INTO "raptor_jobs" ("queue_name", "job_type", "idempotency_key") VALUES (%[1]s, %[2]s, %[3]s);
+			END IF;
+			RETURN NULL;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE FUNCTION "raptor_test_free_key"() RETURNS TRIGGER AS $$
+		BEGIN
+			IF pg_trigger_depth() = 1 THEN
+				UPDATE "raptor_jobs" SET "status" = 'completed', "completed_at" = now()
+				WHERE "idempotency_key" = %[3]s AND "status" = 'pending';
+			END IF;
+			RETURN NULL;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER "raptor_test_take_key" BEFORE INSERT ON "raptor_jobs"
+		FOR EACH STATEMENT EXECUTE FUNCTION "raptor_test_take_key"();
+		CREATE TRIGGER "raptor_test_free_key" AFTER INSERT ON "raptor_jobs"
+		FOR EACH STATEMENT EXECUTE FUNCTION "raptor_test_free_key"();`,
+		quoteLiteral(queue), quoteLiteral(jobType), quoteLiteral(key)))
+	require.NoError(t, err)
+}
+
+func quoteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
 }
 
 func TestEnqueue_KeyFreedConcurrently(t *testing.T) {

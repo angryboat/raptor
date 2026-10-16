@@ -10,6 +10,7 @@ import (
 
 	"github.com/angryboat/raptor/internal/migrate"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -126,25 +127,28 @@ func Enqueue(ctx context.Context, db DB, job EnqueueJob) (string, error) {
 		p.idempotencyKey,
 	)
 	if err != nil {
-		return "", err
+		return "", enqueueError(err)
 	}
 	defer rows.Close()
 
-	var id *string
+	var id string
 	if rows.Next() {
 		if err := rows.Scan(&id); err != nil {
 			return "", err
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return "", err
+		return "", enqueueError(err)
 	}
 
-	if id == nil {
-		return "", errEnqueueMissed
-	}
+	return id, nil
+}
 
-	return *id, nil
+func enqueueError(err error) error {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == "RA001" {
+		return errEnqueueMissed
+	}
+	return err
 }
 
 func Claim(ctx context.Context, db DB, queue, worker string, limit int, timeout time.Duration) ([]*Job, error) {

@@ -35,6 +35,6 @@ BEGIN
     END IF;
   END LOOP;
 
-  RETURN NULL;
+  RAISE EXCEPTION 'raptor: enqueue neither inserted a job nor found one holding its idempotency key' USING ERRCODE = 'RA001';
 END;
 $$ LANGUAGE plpgsql;
