@@ -22,4 +22,5 @@ jobs:
   code-vulnerability:
     runs-on: ubuntu-latest
     steps:
+      - uses: actions/checkout@v7
       - uses: golang/govulncheck-action@v1.1.0
