@@ -57,8 +57,13 @@ then returns, which is handy for tests and scripts.
 ## Jobs
 
 - **Retries**: a worker that returns an error or panics fails the job. It
-  retries right away until it has used `MaxAttempts` (10 by default), then
-  moves to `raptor_dead_jobs`.
+  retries until it has used `MaxAttempts` (10 by default), then moves to
+  `raptor_dead_jobs`. Each retry backs off exponentially with jitter, starting
+  around a second and capped at an hour, so the default 10 attempts span about
+  4 to 9 minutes. An error that implements `RetryAfterError`, even wrapped,
+  picks its own delay instead, which suits rate limits that say when to come
+  back. Callers that settle jobs themselves get the same from `Fail`, or pass
+  an exact delay to `FailAfter`.
 - **Delays and expiry**: `VisibleAt` holds a job back until that time.
   `ExpiresAt` cancels it if it hasn't run by then.
 - **Deduplication**: while a job with the same `IdempotencyKey`, queue and type

@@ -3,6 +3,7 @@ package raptor
 import (
 	"context"
 	"errors"
+	"fmt"
 	"testing"
 	"time"
 
@@ -74,6 +75,38 @@ func TestSerialRunner(t *testing.T) {
 
 		assert.Len(t, worker.ids(), 1)
 		assert.True(t, isDead(t, db, id))
+	})
+
+	t.Run("Execute_WorkerErrorBacksOff", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", MaxAttempts: 3})
+		require.NoError(t, err)
+
+		worker := &recordingWorker{err: errors.New("boom")}
+		r := NewSerialRunner([]string{"default"}, map[string]Worker{"test.job": worker})
+
+		require.NoError(t, r.Execute(t.Context(), db))
+
+		assert.Len(t, worker.ids(), 1)
+		delay := retryDelayOf(t, db, id)
+		assert.GreaterOrEqual(t, delay, retryBaseDelay/2)
+		assert.LessOrEqual(t, delay, retryBaseDelay)
+	})
+
+	t.Run("Execute_WorkerRetryAfter", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", MaxAttempts: 3})
+		require.NoError(t, err)
+
+		worker := &recordingWorker{err: fmt.Errorf("fetch: %w", retryAfterError{after: 42 * time.Second})}
+		r := NewSerialRunner([]string{"default"}, map[string]Worker{"test.job": worker})
+
+		require.NoError(t, r.Execute(t.Context(), db))
+
+		assert.Len(t, worker.ids(), 1)
+		assert.Equal(t, 42*time.Second, retryDelayOf(t, db, id))
 	})
 
 	t.Run("Execute_WorkerContextEndsWithClaim", func(t *testing.T) {
