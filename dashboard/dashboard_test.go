@@ -44,7 +44,7 @@ func TestLoad(t *testing.T) {
 		snap, err := load(t.Context(), db)
 		require.NoError(t, err)
 
-		want := totals{Enqueued: 8, Completed: 1, Failed: 1, Cancelled: 1, Dead: 1}
+		want := totals{Enqueued: 9, Completed: 1, Failed: 1, Cancelled: 1, Dead: 1}
 		for _, got := range snap.Totals {
 			want.Label = got.Label
 			assert.Equal(t, want, got)
@@ -52,7 +52,7 @@ func TestLoad(t *testing.T) {
 
 		assert.Equal(t, []queue{
 			{Name: "cleanup", Cancelled: 1},
-			{Name: "mail", Ready: 2, Delayed: 1, Retrying: 1, Running: 1, Completed: 1, Failed: 1, Dead: 1},
+			{Name: "mail", Ready: 2, Delayed: 1, Retrying: 1, Running: 1, Expired: 1, Completed: 1, Failed: 1, Dead: 1},
 		}, snap.Queues)
 
 		assert.Equal(t, []jobType{
@@ -273,6 +273,9 @@ func seed(t *testing.T, db pgx.Tx) {
 	delayed := mail
 	delayed.VisibleAt = time.Now().Add(time.Hour)
 	enqueue(delayed)
+	expired := delayed
+	expired.ExpiresAt = time.Now().Add(-time.Hour)
+	enqueue(expired)
 
 	require.NoError(t, raptor.Cancel(t.Context(), db, enqueue(raptor.EnqueueJob{Queue: "cleanup", Type: "cleanup.run"})))
 

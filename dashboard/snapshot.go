@@ -37,6 +37,7 @@ type queue struct {
 	Delayed    int64
 	Retrying   int64
 	Running    int64
+	Expired    int64
 	Completed  int64
 	Failed     int64
 	Cancelled  int64
@@ -126,17 +127,22 @@ const totalsQuery = `
 const queuesQuery = `
 	SELECT q."name",
 		coalesce(a."ready", 0), coalesce(a."delayed", 0), coalesce(a."retrying", 0), coalesce(a."running", 0),
+		coalesce(a."expired", 0),
 		coalesce(s."completed", 0), coalesce(s."failed", 0), coalesce(s."cancelled", 0), coalesce(s."dead", 0),
 		coalesce(s."duration_ms", 0)
 	FROM "raptor_queues" q
 	LEFT JOIN (
 		SELECT "queue_name",
-			count(*) FILTER (WHERE "status" = 'pending' AND "failed_at" IS NULL AND "visible_at" <= now()) AS "ready",
-			count(*) FILTER (WHERE "status" = 'pending' AND "failed_at" IS NULL AND "visible_at" > now()) AS "delayed",
-			count(*) FILTER (WHERE "status" = 'pending' AND "failed_at" IS NOT NULL) AS "retrying",
-			count(*) FILTER (WHERE "status" = 'claimed') AS "running"
-		FROM "raptor_jobs"
-		WHERE "status" IN ('pending', 'claimed')
+			count(*) FILTER (WHERE "status" = 'pending' AND NOT "expired" AND "failed_at" IS NULL AND "visible_at" <= now()) AS "ready",
+			count(*) FILTER (WHERE "status" = 'pending' AND NOT "expired" AND "failed_at" IS NULL AND "visible_at" > now()) AS "delayed",
+			count(*) FILTER (WHERE "status" = 'pending' AND NOT "expired" AND "failed_at" IS NOT NULL) AS "retrying",
+			count(*) FILTER (WHERE "status" = 'claimed') AS "running",
+			count(*) FILTER (WHERE "status" = 'pending' AND "expired") AS "expired"
+		FROM (
+			SELECT "queue_name", "status", "failed_at", "visible_at", coalesce("expires_at" <= now(), false) AS "expired"
+			FROM "raptor_jobs"
+			WHERE "status" IN ('pending', 'claimed')
+		) j
 		GROUP BY "queue_name"
 	) a ON a."queue_name" = q."name"
 	LEFT JOIN (

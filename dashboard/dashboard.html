@@ -101,12 +101,12 @@ th.group { text-align: center; border-left: 1px solid var(--line); }
     {{- if .Queues}}
     <div class="scroll"><table>
       <thead>
-        <tr><th></th><th class="group" colspan="4">Now</th><th class="group" colspan="5">All time</th></tr>
-        <tr><th>Queue</th><th class="n split">Ready</th><th class="n">Delayed</th><th class="n">Running</th><th class="n">Retrying</th><th class="n split">Completed</th><th class="n">Failed</th><th class="n">Cancelled</th><th class="n">Dead</th><th class="n">Avg time</th></tr>
+        <tr><th></th><th class="group" colspan="5">Now</th><th class="group" colspan="5">All time</th></tr>
+        <tr><th>Queue</th><th class="n split">Ready</th><th class="n">Delayed</th><th class="n">Running</th><th class="n">Retrying</th><th class="n" title="Past ExpiresAt, waiting for Sweep to cancel them">Expired</th><th class="n split">Completed</th><th class="n">Failed</th><th class="n">Cancelled</th><th class="n">Dead</th><th class="n">Avg time</th></tr>
       </thead>
       <tbody>
       {{- range .Queues}}
-        <tr><th scope="row">{{.Name}}</th><td class="n split{{if not .Ready}} zero{{end}}">{{num .Ready}}</td>{{template "n" .Delayed}}{{template "n" .Running}}{{template "warn" .Retrying}}<td class="n split{{if not .Completed}} zero{{end}}">{{num .Completed}}</td>{{template "warn" .Failed}}{{template "n" .Cancelled}}{{template "bad" .Dead}}{{template "avg" .AvgDuration}}</tr>
+        <tr><th scope="row">{{.Name}}</th><td class="n split{{if not .Ready}} zero{{end}}">{{num .Ready}}</td>{{template "n" .Delayed}}{{template "n" .Running}}{{template "warn" .Retrying}}{{template "warn" .Expired}}<td class="n split{{if not .Completed}} zero{{end}}">{{num .Completed}}</td>{{template "warn" .Failed}}{{template "n" .Cancelled}}{{template "bad" .Dead}}{{template "avg" .AvgDuration}}</tr>
       {{- end}}
       </tbody>
     </table></div>
