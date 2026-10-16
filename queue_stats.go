@@ -18,7 +18,7 @@ type JobStat struct {
 }
 
 func LoadQueueStat(ctx context.Context, db DB, queue string) (*QueueStat, error) {
-	query := `SELECT "job_type", "completed_count", "failed_count", "cancelled_count", "dead_count", "total_duration_ms" FROM "raptor_job_stats" WHERE "queue_name" = $1`
+	query := `SELECT "job_type", "completed_count", "failed_count", "cancelled_count", "dead_count", "total_duration_ms" FROM "raptor_job_stat_totals" WHERE "queue_name" = $1`
 	rows, err := db.Query(ctx, query, queue)
 	if err != nil {
 		return nil, err

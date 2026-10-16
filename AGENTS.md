@@ -44,6 +44,11 @@ API; this file covers how to change it safely.
   and on fencing: `Complete`, `Fail` and `Release` only apply when
   `claimed_by` and `attempts` match the caller's claim. Keep both. A settle
   that misses must report `CLAIM_LOST` or `NOT_FOUND`.
+- Stats are append-only. `raptor_bump_stats` and writes to the
+  `raptor_job_stats` view insert event rows, which `raptor_rollup_stats` (run
+  by `Cleanup`) folds into `raptor_stats` and `raptor_job_stat_rollups`. Never
+  update a shared counter row on a state change: a caller's open transaction
+  would hold its lock.
 - For any time that more than one process compares, use the database clock
   (`now()`), not Go's.
 - Accept the narrowest interface: `DB` (only `Query`) or `TxDB` (adds

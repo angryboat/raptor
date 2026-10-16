@@ -122,20 +122,46 @@ Call these on a timer, or from a scheduled job:
 - `Sweep` retries jobs whose claim has expired and cancels jobs whose
   `ExpiresAt` has passed.
 - `Cleanup` deletes completed jobs after 24 hours and cancelled jobs after 2
-  hours.
+  hours, and rolls up stats.
 
 `LoadQueueStat` reports completed, failed, cancelled and dead counts for each
-job type in a queue.
+job type in a queue. Each state change records its counts as a new row rather
+than updating shared counters, so a transaction left open after `Enqueue` or
+`Complete` doesn't block other workers. `Cleanup` folds those rows into the
+totals. Counts are exact either way, but reading them gets slower the longer
+`Cleanup` goes without running.
 
 ## Dashboard
 
 `dashboard.New` returns an `http.Handler` that renders a read-only page of
 queue depths and lifetime counts, running, retrying and dead jobs, and each
-schedule's next run. Turn on its Live toggle to refresh every 5 seconds. It
+schedule's next run. Its throughput counts for today, this week (starting
+Monday) and this month use UTC days, whatever time zone the database or each
+connection is set to. Turn on its Live toggle to refresh every 5 seconds. It
 does no authentication, so wrap it in your own middleware.
 
 ```go
 mux.Handle("/raptor/", http.StripPrefix("/raptor", requireAdmin(password, dashboard.New(pool))))
+```
+
+Each render reuses data loaded within the last `CacheTTL` (default
+`dashboard.DefaultCacheTTL`, 2 seconds), and requests that arrive during a
+load wait for it, so any number of open dashboards cost the database at most
+one set of queries per TTL. Set `CacheTTL` on the handler before serving to
+change it; zero or less reloads for every request, sharing only a load in flight.
+A load that takes longer than 30 seconds is abandoned, so a hung query fails
+the requests waiting on it instead of stalling the dashboard.
+
+Queue depths come from an index-only scan of `idx_raptor_jobs_queue_depth`, a
+partial index over pending and claimed jobs. `Setup` builds it inside a
+transaction, which blocks writes to `raptor_jobs` while it runs. On a large
+table, build it first without blocking and `Setup` will skip it. If the
+build fails, drop the invalid index it leaves before running `Setup`.
+
+```sql
+CREATE INDEX CONCURRENTLY "idx_raptor_jobs_queue_depth" ON "raptor_jobs"
+  ("queue_name", "status", "visible_at", "failed_at", "expires_at")
+  WHERE "status" IN ('pending', 'claimed');
 ```
 
 ## Development
