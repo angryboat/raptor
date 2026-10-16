@@ -58,6 +58,18 @@ if it isn't positive. Don't change `Queue`, `Workers` or `Threads` while `Run`
 is running; it reads them without locking. `SerialRunner` empties its queues
 one job at a time and then returns, which is handy for tests and scripts.
 
+By default, shutdown waits as long as the slowest running job, up to its
+claim deadline. If the process is killed first, say by a Kubernetes
+termination grace period, the job stays claimed until `Sweep` reaps it, and
+that costs an attempt. Set `ShutdownTimeout` on either runner to bound the
+wait: once `ctx` is done and the timeout passes, the runner cancels the
+contexts of the jobs still running. A job that then returns an error is
+released back to pending without using an attempt; one that returns nil is
+completed. The trade-off is that interrupted jobs run again from the start, so
+they should be idempotent, and workers must return when their context ends,
+since the runner still waits for them. Leave room within the grace period for
+the runner to settle jobs after the timeout.
+
 ## Jobs
 
 - **Retries**: a worker that returns an error or panics fails the job, as does

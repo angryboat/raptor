@@ -5,11 +5,16 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"log/slog"
+	"time"
 )
 
 type SerialRunner struct {
 	Queue   []string
 	Workers map[string]Worker
+	// ShutdownTimeout bounds how long Execute lets the running job continue
+	// once its context is done. It behaves as it does on
+	// ConcurrentWeightedRunner.
+	ShutdownTimeout time.Duration
 
 	id string
 }
@@ -25,8 +30,15 @@ func NewSerialRunner(queue []string, workers map[string]Worker) *SerialRunner {
 // Execute drains each queue in Queue, in slice order: a queue is claimed
 // from repeatedly until empty before the next queue in the slice starts.
 func (r *SerialRunner) Execute(ctx context.Context, db DB) error {
+	if err := validateShutdownTimeout(r.ShutdownTimeout); err != nil {
+		return err
+	}
+
+	jobCtx, stopJobs := shutdownContext(ctx, r.ShutdownTimeout)
+	defer stopJobs()
+
 	for _, queue := range r.Queue {
-		if err := r.drainQueue(ctx, db, queue); err != nil {
+		if err := r.drainQueue(ctx, jobCtx, db, queue); err != nil {
 			return err
 		}
 	}
@@ -34,7 +46,7 @@ func (r *SerialRunner) Execute(ctx context.Context, db DB) error {
 	return nil
 }
 
-func (r *SerialRunner) drainQueue(ctx context.Context, db DB, queue string) error {
+func (r *SerialRunner) drainQueue(ctx, jobCtx context.Context, db DB, queue string) error {
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
@@ -48,7 +60,7 @@ func (r *SerialRunner) drainQueue(ctx context.Context, db DB, queue string) erro
 			return nil
 		}
 
-		r.runJob(ctx, db, jobs[0])
+		r.runJob(jobCtx, db, jobs[0])
 	}
 }
 

@@ -271,6 +271,71 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 		assert.Equal(t, jobState{Status: "completed", Attempts: 1}, readJobState(t, db, ids[0]))
 	})
 
+	t.Run("ShutdownTimeoutReleasesInFlightJob", func(t *testing.T) {
+		const timeout = 100 * time.Millisecond
+		ids := enqueueN(t, db, "run-shutdown-timeout", 1)
+
+		worker := newBlockingWorker()
+		r := NewConcurrentWeightedRunner(map[string]int{"run-shutdown-timeout": 1}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.ShutdownTimeout = timeout
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		worker.awaitStart(t)
+		cancel()
+		cancelled := time.Now()
+
+		select {
+		case err := <-done:
+			require.NoError(t, err)
+		case <-time.After(3 * time.Second):
+			t.Fatal("Run never returned after the shutdown timeout")
+		}
+
+		assert.GreaterOrEqual(t, time.Since(cancelled), timeout)
+		assert.Equal(t, jobState{Status: "pending", Attempts: 0}, readJobState(t, db, ids[0]))
+	})
+
+	t.Run("ShutdownTimeoutCompletesJobFinishedInTime", func(t *testing.T) {
+		ids := enqueueN(t, db, "run-shutdown-in-time", 1)
+
+		worker := newBlockingWorker()
+		r := NewConcurrentWeightedRunner(map[string]int{"run-shutdown-in-time": 1}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.ShutdownTimeout = 5 * time.Second
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		worker.awaitStart(t)
+		cancel()
+		close(worker.unblock)
+		require.NoError(t, <-done)
+
+		assert.Equal(t, jobState{Status: "completed", Attempts: 1}, readJobState(t, db, ids[0]))
+	})
+
+	t.Run("NegativeShutdownTimeout", func(t *testing.T) {
+		const queue = "run-shutdown-negative"
+		enqueueN(t, db, queue, 1)
+
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 1}, nil)
+		r.ShutdownTimeout = -time.Second
+
+		assert.EqualError(t, r.Run(t.Context(), db), "raptor: shutdown timeout -1s must not be negative")
+		assert.Zero(t, countClaimed(t, db, queue))
+	})
+
 	t.Run("ClaimsNoMoreThanIdleWorkers", func(t *testing.T) {
 		const queue = "run-claims-idle"
 		const threads = 2

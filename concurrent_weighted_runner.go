@@ -22,6 +22,12 @@ type ConcurrentWeightedRunner struct {
 	// Threads is how many jobs Run executes at once. It must be positive;
 	// NewConcurrentWeightedRunner sets it to runtime.NumCPU().
 	Threads int
+	// ShutdownTimeout bounds how long Run waits for in-flight jobs once its
+	// context is done. When it elapses, Run cancels their contexts and
+	// releases any job whose worker then returns an error, so it goes back to
+	// pending without using an attempt. Zero waits for jobs to finish, up to
+	// their claim deadline. It must not be negative.
+	ShutdownTimeout time.Duration
 
 	emptyCooldown time.Duration
 	id            string
@@ -46,9 +52,15 @@ func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
 	if c.Threads <= 0 {
 		return fmt.Errorf("raptor: runner threads %d must be positive", c.Threads)
 	}
+	if err := validateShutdownTimeout(c.ShutdownTimeout); err != nil {
+		return err
+	}
 
 	ctx, cancel := context.WithCancelCause(parent)
 	defer cancel(nil)
+
+	jobCtx, stopJobs := shutdownContext(ctx, c.ShutdownTimeout)
+	defer stopJobs()
 
 	queues := weightedQueues(c.Queue)
 	idle := newIdleWorkers(c.Threads)
@@ -71,7 +83,7 @@ func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
 				if ctx.Err() != nil {
 					c.release(ctx, db, job)
 				} else {
-					c.execute(ctx, db, job)
+					c.execute(jobCtx, db, job)
 				}
 				idle.put(1)
 			}
@@ -227,20 +239,59 @@ func (c *ConcurrentWeightedRunner) release(ctx context.Context, db DB, jobs ...*
 
 const settleTimeout = 10 * time.Second
 
+func validateShutdownTimeout(timeout time.Duration) error {
+	if timeout < 0 {
+		return fmt.Errorf("raptor: shutdown timeout %s must not be negative", timeout)
+	}
+	return nil
+}
+
+func shutdownContext(ctx context.Context, timeout time.Duration) (context.Context, context.CancelFunc) {
+	jobCtx, cancel := context.WithCancel(context.WithoutCancel(ctx))
+	if timeout == 0 {
+		return jobCtx, cancel
+	}
+
+	go func() {
+		select {
+		case <-jobCtx.Done():
+			return
+		case <-ctx.Done():
+		}
+
+		timer := time.NewTimer(timeout)
+		defer timer.Stop()
+
+		select {
+		case <-jobCtx.Done():
+		case <-timer.C:
+			cancel()
+		}
+	}()
+
+	return jobCtx, cancel
+}
+
 func settleContext(ctx context.Context) (context.Context, context.CancelFunc) {
 	return context.WithTimeout(context.WithoutCancel(ctx), settleTimeout)
 }
 
 func executeJob(ctx context.Context, db DB, worker Worker, job *Job) error {
 	err := runWorker(ctx, worker, job)
+	interrupted := ctx.Err() != nil
 
 	ctx, cancel := settleContext(ctx)
 	defer cancel()
 
-	if err != nil {
+	switch {
+	case err == nil:
+		return Complete(ctx, db, job)
+	case interrupted:
+		// The error most likely came from shutdown cancelling ctx, so it shouldn't cost an attempt.
+		return Release(ctx, db, job)
+	default:
 		return Fail(ctx, db, job, err)
 	}
-	return Complete(ctx, db, job)
 }
 
 func runWorker(ctx context.Context, worker Worker, job *Job) (err error) {
@@ -254,7 +305,7 @@ func runWorker(ctx context.Context, worker Worker, job *Job) (err error) {
 		return fmt.Errorf("raptor: no worker registered for job type %q", job.Type)
 	}
 
-	ctx, cancel := context.WithDeadline(context.WithoutCancel(ctx), job.ClaimDeadline())
+	ctx, cancel := context.WithDeadline(ctx, job.ClaimDeadline())
 	defer cancel()
 
 	return worker.Execute(ctx, job)
