@@ -38,6 +38,13 @@ API; this file covers how to change it safely.
   `NNNNNN_description.sql` instead, with the name minus `.sql` at most 32
   characters. Each file runs in one transaction. To change a function, use
   `CREATE OR REPLACE` in a new migration.
+- Name columns when Go scans a job row or SQL copies one between tables, never
+  `SELECT *`; `ADD COLUMN` appends, so positions drift.
+  `raptor_dead_jobs` was created with `LIKE "raptor_jobs"` and doesn't follow
+  later changes, so a migration that adds a column to `raptor_jobs` must add it
+  to `raptor_dead_jobs` too, add it to the column lists in `raptor_fail_job`'s
+  dead-job move, and add a tagged field to `Job` plus an entry in
+  `jobColumns` if Go should read it.
 - Prefix every table, type and function with `raptor_`, and double-quote
   identifiers.
 - Correctness under concurrency depends on row locks (`FOR UPDATE SKIP LOCKED`)
