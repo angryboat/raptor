@@ -82,6 +82,43 @@ func TestLoad(t *testing.T) {
 		assert.Equal(t, "bounced", snap.Dead[0].Error)
 	})
 
+	t.Run("RolledUp", func(t *testing.T) {
+		db := beginTx(t, conn)
+		seed(t, db)
+
+		before, err := load(t.Context(), db)
+		require.NoError(t, err)
+		require.NoError(t, raptor.Cleanup(t.Context(), db, ""))
+
+		after, err := load(t.Context(), db)
+		require.NoError(t, err)
+
+		assert.Equal(t, before.Totals, after.Totals)
+		assert.Equal(t, before.Queues, after.Queues)
+		assert.Equal(t, before.JobTypes, after.JobTypes)
+	})
+
+	t.Run("WindowsSumDayRows", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		exec(t, db, `INSERT INTO "raptor_stats" ("date", "span", "total_jobs") VALUES
+			(CURRENT_DATE - 400, 'day', 100),
+			(CURRENT_DATE, 'day', 5),
+			(DATE '1970-01-01', 'all_time', 105)`)
+		_, err := raptor.Enqueue(t.Context(), db, raptor.EnqueueJob{Queue: "mail", Type: "mail.send"})
+		require.NoError(t, err)
+
+		snap, err := load(t.Context(), db)
+		require.NoError(t, err)
+
+		assert.Equal(t, []totals{
+			{Label: "Today", Enqueued: 6},
+			{Label: "This week", Enqueued: 6},
+			{Label: "This month", Enqueued: 6},
+			{Label: "All time", Enqueued: 106},
+		}, snap.Totals)
+	})
+
 	t.Run("Overdue", func(t *testing.T) {
 		db := beginTx(t, conn)
 		seed(t, db)

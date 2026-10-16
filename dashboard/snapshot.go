@@ -113,15 +113,27 @@ type deadJob struct {
 
 const totalsQuery = `
 	SELECT p."label",
-		coalesce(s."total_jobs", 0), coalesce(s."total_completed", 0), coalesce(s."total_failed", 0),
-		coalesce(s."total_cancelled", 0), coalesce(s."total_dead", 0)
+		coalesce(sum(s."total_jobs"), 0)::bigint, coalesce(sum(s."total_completed"), 0)::bigint,
+		coalesce(sum(s."total_failed"), 0)::bigint, coalesce(sum(s."total_cancelled"), 0)::bigint,
+		coalesce(sum(s."total_dead"), 0)::bigint
 	FROM (VALUES
-		(1, 'Today', 'day', CURRENT_DATE),
-		(2, 'This week', 'week', date_trunc('week', now())::date),
-		(3, 'This month', 'month', date_trunc('month', now())::date),
-		(4, 'All time', 'all_time', DATE '1970-01-01')
-	) AS p("ord", "label", "span", "date")
-	LEFT JOIN "raptor_stats" s ON s."span" = p."span" AND s."date" = p."date"
+		(1, 'Today', CURRENT_DATE),
+		(2, 'This week', date_trunc('week', now())::date),
+		(3, 'This month', date_trunc('month', now())::date),
+		(4, 'All time', NULL)
+	) AS p("ord", "label", "since")
+	LEFT JOIN (
+		SELECT "span"::text AS "source", "date", "total_jobs", "total_completed", "total_failed", "total_cancelled", "total_dead"
+		FROM "raptor_stats"
+		WHERE "span" IN ('day', 'all_time')
+		UNION ALL
+		SELECT 'event', "date", "total_jobs", "total_completed", "total_failed", "total_cancelled", "total_dead"
+		FROM "raptor_stat_events"
+	) s ON CASE
+		WHEN p."since" IS NULL THEN s."source" <> 'day'
+		ELSE s."source" <> 'all_time' AND s."date" >= p."since"
+	END
+	GROUP BY p."ord", p."label"
 	ORDER BY p."ord"`
 
 const queuesQuery = `
@@ -150,14 +162,14 @@ const queuesQuery = `
 			sum("completed_count")::bigint AS "completed", sum("failed_count")::bigint AS "failed",
 			sum("cancelled_count")::bigint AS "cancelled", sum("dead_count")::bigint AS "dead",
 			sum("total_duration_ms")::bigint AS "duration_ms"
-		FROM "raptor_job_stats"
+		FROM "raptor_job_stat_totals"
 		GROUP BY "queue_name"
 	) s ON s."queue_name" = q."name"
 	ORDER BY q."name"`
 
 const jobTypesQuery = `
 	SELECT "queue_name", "job_type", "completed_count", "failed_count", "cancelled_count", "dead_count", "total_duration_ms"
-	FROM "raptor_job_stats"
+	FROM "raptor_job_stat_totals"
 	ORDER BY "queue_name", "job_type"`
 
 const schedulesQuery = `

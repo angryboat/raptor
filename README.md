@@ -122,10 +122,14 @@ Call these on a timer, or from a scheduled job:
 - `Sweep` retries jobs whose claim has expired and cancels jobs whose
   `ExpiresAt` has passed.
 - `Cleanup` deletes completed jobs after 24 hours and cancelled jobs after 2
-  hours.
+  hours, and rolls up stats.
 
 `LoadQueueStat` reports completed, failed, cancelled and dead counts for each
-job type in a queue.
+job type in a queue. Each state change records its counts as a new row rather
+than updating shared counters, so a transaction left open after `Enqueue` or
+`Complete` doesn't block other workers. `Cleanup` folds those rows into the
+totals. Counts are exact either way, but reading them gets slower the longer
+`Cleanup` goes without running.
 
 ## Dashboard
 
