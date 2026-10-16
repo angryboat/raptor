@@ -1,0 +1,26 @@
+name: Go
+on:
+  push:
+    branches: ["main"]
+  pull_request: {}
+  workflow_call: {}
+  schedule:
+    - cron: "0 0 * * 6"
+permissions:
+  contents: read
+concurrency:
+  group: go-${{ github.workflow }}-${{ github.head_ref || github.run_id }}
+  cancel-in-progress: true
+jobs:
+  security-scan:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: securego/gosec@v2.29.0
+        with:
+          args: ./...
+  code-vulnerability:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v7
+      - uses: golang/govulncheck-action@v1.1.0
