@@ -5,11 +5,13 @@ package dashboard
 
 import (
 	"bytes"
+	"context"
 	_ "embed"
 	"fmt"
 	"html/template"
 	"net/http"
 	"strconv"
+	"sync"
 	"time"
 
 	"github.com/angryboat/raptor"
@@ -25,17 +27,39 @@ var tmpl = template.Must(template.New("dashboard").Funcs(template.FuncMap{
 	"iso":      formatISO,
 }).Parse(page))
 
+// DefaultCacheTTL is the CacheTTL that New sets.
+const DefaultCacheTTL = 2 * time.Second
+
 // Handler serves the dashboard. It does no authentication or authorization,
 // so wrap it in your own middleware before exposing it.
 type Handler struct {
-	db raptor.DB
+	// CacheTTL is how long the data behind one render serves later requests,
+	// counted from when its queries began. Requests that arrive while it loads
+	// wait for it rather than querying again, so any number of viewers share
+	// one set of queries. Zero or less disables reuse but still shares a load
+	// in flight. Set it before serving.
+	CacheTTL time.Duration
+
+	db  raptor.DB
+	now func() time.Time
+
+	mu       sync.Mutex
+	cached   *snapshot
+	loadedAt time.Time
+	loading  *flight
 }
 
-// New returns a Handler that reads from db. Pass a *pgxpool.Pool rather than
-// a *pgx.Conn, since requests can arrive concurrently and a connection runs
-// one query at a time.
+type flight struct {
+	done chan struct{}
+	snap snapshot
+	err  error
+}
+
+// New returns a Handler that reads from db, with CacheTTL set to
+// DefaultCacheTTL. Pass a *pgxpool.Pool rather than a *pgx.Conn, since
+// requests can arrive concurrently and a connection runs one query at a time.
 func New(db raptor.DB) *Handler {
-	return &Handler{db: db}
+	return &Handler{CacheTTL: DefaultCacheTTL, db: db, now: time.Now}
 }
 
 // ServeHTTP renders the dashboard for GET and HEAD requests to any path and
@@ -49,7 +73,7 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 
-	snap, err := load(r.Context(), h.db)
+	snap, err := h.current(r.Context())
 	if err != nil {
 		http.Error(w, "raptor: dashboard: "+err.Error(), http.StatusInternalServerError)
 		return
@@ -64,6 +88,44 @@ func (h *Handler) ServeHTTP(w http.ResponseWriter, r *http.Request) {
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.Header().Set("Cache-Control", "no-store")
 	_, _ = buf.WriteTo(w)
+}
+
+func (h *Handler) current(ctx context.Context) (snapshot, error) {
+	h.mu.Lock()
+	if h.cached != nil && h.now().Sub(h.loadedAt) < h.CacheTTL {
+		snap := *h.cached
+		h.mu.Unlock()
+		return snap, nil
+	}
+	f := h.loading
+	if f == nil {
+		f = &flight{done: make(chan struct{})}
+		h.loading = f
+		go h.fill(context.WithoutCancel(ctx), f, h.now())
+	}
+	h.mu.Unlock()
+
+	select {
+	case <-f.done:
+		return f.snap, f.err
+	case <-ctx.Done():
+		return snapshot{}, ctx.Err()
+	}
+}
+
+// fill outlives its request so the viewers sharing it don't fail when that one leaves.
+func (h *Handler) fill(ctx context.Context, f *flight, startedAt time.Time) {
+	f.snap, f.err = load(ctx, h.db)
+
+	h.mu.Lock()
+	h.loading = nil
+	if f.err == nil {
+		h.cached = &f.snap
+		h.loadedAt = startedAt
+	}
+	h.mu.Unlock()
+
+	close(f.done)
 }
 
 type view struct {
