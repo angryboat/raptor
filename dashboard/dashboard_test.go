@@ -5,6 +5,7 @@ import (
 	"errors"
 	"net/http"
 	"net/http/httptest"
+	"strings"
 	"testing"
 	"time"
 
@@ -178,6 +179,20 @@ func TestLoad(t *testing.T) {
 		require.Len(t, snap.Schedules, 1)
 		assert.True(t, snap.Schedules[0].Due)
 		assert.False(t, snap.Schedules[0].Abandoned)
+	})
+
+	t.Run("QueueDepthsScanOnlyTheIndex", func(t *testing.T) {
+		db := beginTx(t, conn)
+		seed(t, db)
+		exec(t, db, `SET LOCAL enable_seqscan = off`)
+		exec(t, db, `SET LOCAL enable_bitmapscan = off`)
+
+		rows, err := db.Query(t.Context(), `EXPLAIN `+queuesQuery)
+		require.NoError(t, err)
+		plan, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		require.NoError(t, err)
+
+		assert.Contains(t, strings.Join(plan, "\n"), `Index Only Scan using idx_raptor_jobs_queue_depth on raptor_jobs`)
 	})
 
 	t.Run("CapsLists", func(t *testing.T) {

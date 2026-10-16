@@ -144,6 +144,18 @@ does no authentication, so wrap it in your own middleware.
 mux.Handle("/raptor/", http.StripPrefix("/raptor", requireAdmin(password, dashboard.New(pool))))
 ```
 
+Queue depths come from an index-only scan of `idx_raptor_jobs_queue_depth`, a
+partial index over pending and claimed jobs. `Setup` builds it inside a
+transaction, which blocks writes to `raptor_jobs` while it runs. On a large
+table, build it first without blocking and `Setup` will skip it. If the
+build fails, drop the invalid index it leaves before running `Setup`.
+
+```sql
+CREATE INDEX CONCURRENTLY "idx_raptor_jobs_queue_depth" ON "raptor_jobs"
+  ("queue_name", "status", "visible_at", "failed_at", "expires_at")
+  WHERE "status" IN ('pending', 'claimed');
+```
+
 ## Development
 
 ```sh
