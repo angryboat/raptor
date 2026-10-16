@@ -347,6 +347,41 @@ func TestRaptor(t *testing.T) {
 		assert.ErrorIs(t, err, ErrJobNotFound)
 	})
 
+	t.Run("Fail_Dead_AddedColumn", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		_, err := db.Exec(t.Context(), `ALTER TABLE "raptor_jobs" ADD COLUMN "test_added" TEXT NOT NULL DEFAULT 'added'`)
+		require.NoError(t, err)
+		// A statement cached by an earlier subtest keeps the old row shape and would hide a SELECT * regression.
+		require.NoError(t, conn.DeallocateAll(t.Context()))
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:       "default",
+			Type:        "test.job",
+			Payload:     map[string]any{"foo": "bar"},
+			MaxAttempts: 1,
+		})
+		require.NoError(t, err)
+
+		claimed, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+
+		job := claimed[0]
+		assert.Equal(t, id, job.ID)
+		assert.Equal(t, "test.job", job.Type)
+		assert.JSONEq(t, `{"foo":"bar"}`, string(job.Payload))
+		assert.Equal(t, int32(1), job.Attempts)
+
+		require.NoError(t, Fail(t.Context(), db, job, errors.New("boom")))
+
+		var status, reason string
+		err = db.QueryRow(t.Context(), `SELECT "status"::text, "failure_info"->>'error' FROM "raptor_dead_jobs" WHERE "id" = $1`, id).Scan(&status, &reason)
+		require.NoError(t, err)
+		assert.Equal(t, "failed", status)
+		assert.Equal(t, "boom", reason)
+	})
+
 	t.Run("Release", func(t *testing.T) {
 		db := beginTx(t, conn)
 
