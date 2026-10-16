@@ -231,7 +231,7 @@ func (c *ConcurrentWeightedRunner) release(ctx context.Context, db DB, jobs ...*
 	defer cancel()
 
 	for _, job := range jobs {
-		if err := Release(ctx, db, job); err != nil {
+		if err := ignoreClaimLost(ctx, job, Release(ctx, db, job)); err != nil {
 			slog.ErrorContext(ctx, "failed to release job", slog.String("job-id", job.ID), slog.String("job-type", job.Type), slog.String("queue", job.Queue), slog.String("runner-id", c.id), slog.Any("error", err))
 		}
 	}
