@@ -11,6 +11,7 @@ import (
 
 	"github.com/angryboat/raptor/internal/migrate"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -128,25 +129,28 @@ func Enqueue(ctx context.Context, db DB, job EnqueueJob) (string, error) {
 		p.idempotencyKey,
 	)
 	if err != nil {
-		return "", err
+		return "", enqueueError(err)
 	}
 	defer rows.Close()
 
-	var id *string
+	var id string
 	if rows.Next() {
 		if err := rows.Scan(&id); err != nil {
 			return "", err
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return "", err
+		return "", enqueueError(err)
 	}
 
-	if id == nil {
-		return "", nil
-	}
+	return id, nil
+}
 
-	return *id, nil
+func enqueueError(err error) error {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == "RA001" {
+		return errEnqueueMissed
+	}
+	return err
 }
 
 // Claim claims up to limit pending jobs from queue for worker. A positive
@@ -183,6 +187,8 @@ var (
 	// doesn't: it was reaped, reclaimed, cancelled, already settled or moved
 	// to the dead jobs.
 	ErrClaimLost = errors.New("raptor: job claim lost")
+
+	errEnqueueMissed = errors.New("raptor: enqueue neither inserted a job nor found one holding its idempotency key")
 )
 
 // ClaimDeadline is when the job's claim expires and Sweep may hand it to
@@ -246,22 +252,43 @@ type RetryAfterError interface {
 	RetryAfter() time.Duration
 }
 
+// Permanent marks err as a failure that retrying won't fix, such as a payload
+// that can't be decoded. Fail and FailAfter move a job failed with it, even
+// wrapped, straight to the dead jobs whatever its remaining attempts. The
+// returned error has err's message and unwraps to err. Permanent(nil) is nil.
+func Permanent(err error) error {
+	if err == nil {
+		return nil
+	}
+	return &permanentError{err: err}
+}
+
+type permanentError struct {
+	err error
+}
+
+func (e *permanentError) Error() string { return e.err.Error() }
+
+func (e *permanentError) Unwrap() error { return e.err }
+
 const (
 	retryBaseDelay = time.Second
 	retryMaxDelay  = time.Hour
 )
 
 // Fail records a failed attempt of a claimed job, scheduling a retry or
-// moving it to the dead jobs once its attempts are exhausted. The retry waits
-// for failure's RetryAfterError delay if it has a positive one, and otherwise
-// backs off exponentially with jitter from one second after the first attempt
-// up to an hour. It returns ErrClaimLost if the job was reaped, reclaimed,
-// cancelled or settled since job was claimed.
+// moving it to the dead jobs once its attempts are exhausted or failure is
+// marked by Permanent. The retry waits for failure's RetryAfterError delay if
+// it has a positive one, and otherwise backs off exponentially with jitter
+// from one second after the first attempt up to an hour. It returns
+// ErrClaimLost if the job was reaped, reclaimed, cancelled or settled since
+// job was claimed.
 func Fail(ctx context.Context, db DB, job *Job, failure error) error {
 	return FailAfter(ctx, db, job, failure, retryDelay(job.Attempts, failure))
 }
 
-// FailAfter is Fail with an explicit delay before the retry.
+// FailAfter is Fail with an explicit delay before the retry. A failure marked
+// by Permanent still moves the job to the dead jobs.
 func FailAfter(ctx context.Context, db DB, job *Job, failure error, delay time.Duration) error {
 	var info any
 	if failure != nil {
@@ -272,7 +299,9 @@ func FailAfter(ctx context.Context, db DB, job *Job, failure error, delay time.D
 		return err
 	}
 
-	return settleClaim(ctx, db, `SELECT "raptor_fail_job"($1, $2, $3, $4, $5)`, job.ID, job.ClaimedBy, job.Attempts, infoJSON, delay)
+	_, permanent := errors.AsType[*permanentError](failure)
+
+	return settleClaim(ctx, db, `SELECT "raptor_fail_job"($1, $2, $3, $4, $5, $6)`, job.ID, job.ClaimedBy, job.Attempts, infoJSON, delay, permanent)
 }
 
 func retryDelay(attempts int32, failure error) time.Duration {

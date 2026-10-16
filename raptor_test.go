@@ -4,6 +4,7 @@ import (
 	"errors"
 	"fmt"
 	"math"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -431,6 +432,88 @@ func TestRaptor(t *testing.T) {
 		assert.Equal(t, []string{"second"}, reasons)
 	})
 
+	t.Run("Fail_Permanent", func(t *testing.T) {
+		for name, tc := range map[string]struct {
+			failure error
+			reason  string
+			dead    bool
+		}{
+			"Marked":    {failure: Permanent(errors.New("bad payload")), reason: "bad payload", dead: true},
+			"Wrapped":   {failure: fmt.Errorf("handle: %w", Permanent(errors.New("bad payload"))), reason: "handle: bad payload", dead: true},
+			"NotMarked": {failure: errors.New("flaky"), reason: "flaky", dead: false},
+		} {
+			t.Run(name, func(t *testing.T) {
+				db := beginTx(t, conn)
+
+				id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "permanent", Type: "test.job", MaxAttempts: 10})
+				require.NoError(t, err)
+
+				claimed, err := Claim(t.Context(), db, "permanent", "worker-1", 1, time.Minute)
+				require.NoError(t, err)
+				require.Len(t, claimed, 1)
+				require.Equal(t, int32(1), claimed[0].Attempts)
+
+				require.NoError(t, Fail(t.Context(), db, claimed[0], tc.failure))
+
+				assert.Equal(t, tc.dead, isDead(t, db, id))
+
+				table := `"raptor_jobs"`
+				if tc.dead {
+					table = `"raptor_dead_jobs"`
+				}
+				var reason string
+				var attempts int32
+				err = db.QueryRow(t.Context(), `SELECT "failure_info"->>'error', "attempts" FROM `+table+` WHERE "id" = $1`, id).Scan(&reason, &attempts)
+				require.NoError(t, err)
+				assert.Equal(t, tc.reason, reason)
+				assert.Equal(t, int32(1), attempts)
+
+				stat, err := LoadQueueStat(t.Context(), db, "permanent")
+				require.NoError(t, err)
+				js := stat.Jobs["test.job"]
+				if tc.dead {
+					assert.Equal(t, uint64(1), js.DeadCount)
+					assert.Zero(t, js.FailedCount)
+				} else {
+					assert.Zero(t, js.DeadCount)
+					assert.Equal(t, uint64(1), js.FailedCount)
+				}
+			})
+		}
+	})
+
+	t.Run("FailAfter_Permanent", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "permanent", Type: "test.job", MaxAttempts: 10})
+		require.NoError(t, err)
+
+		claimed, err := Claim(t.Context(), db, "permanent", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+
+		require.NoError(t, FailAfter(t.Context(), db, claimed[0], Permanent(errors.New("bad payload")), time.Minute))
+
+		assert.True(t, isDead(t, db, id))
+	})
+
+	t.Run("Fail_Permanent_ClaimLost", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "permanent", Type: "test.job", MaxAttempts: 10})
+		require.NoError(t, err)
+
+		claimed, err := Claim(t.Context(), db, "permanent", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+
+		stale := *claimed[0]
+		stale.ClaimedBy = new("worker-2")
+
+		assert.ErrorIs(t, Fail(t.Context(), db, &stale, Permanent(errors.New("bad payload"))), ErrClaimLost)
+		assert.False(t, isDead(t, db, id))
+	})
+
 	t.Run("DeadJobs_Indexes", func(t *testing.T) {
 		db := beginTx(t, conn)
 
@@ -787,6 +870,152 @@ func TestRaptor(t *testing.T) {
 
 		assert.Equal(t, firstID, secondID)
 	})
+
+	t.Run("Enqueue_KeyFreedBeforeLookup", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		job := EnqueueJob{Queue: "default", Type: "test.job", IdempotencyKey: "freed-key"}
+		firstID, err := Enqueue(t.Context(), db, job)
+		require.NoError(t, err)
+
+		_, err = db.Exec(t.Context(), `SELECT set_config('raptor.test_free_job', $1, true)`, firstID)
+		require.NoError(t, err)
+		_, err = db.Exec(t.Context(), `
+			CREATE FUNCTION "raptor_test_free_job"() RETURNS TRIGGER AS $$
+			BEGIN
+				UPDATE "raptor_jobs" SET "status" = 'completed', "completed_at" = now()
+				WHERE "id" = current_setting('raptor.test_free_job')::uuid AND "status" = 'pending';
+				RETURN NULL;
+			END;
+			$$ LANGUAGE plpgsql;
+			CREATE TRIGGER "raptor_test_free_job" AFTER INSERT ON "raptor_jobs"
+			FOR EACH STATEMENT EXECUTE FUNCTION "raptor_test_free_job"();`)
+		require.NoError(t, err)
+
+		before := globalTotals(t, db).Jobs
+
+		secondID, err := Enqueue(t.Context(), db, job)
+		require.NoError(t, err)
+		assert.NotEmpty(t, secondID)
+		assert.NotEqual(t, firstID, secondID)
+		assert.Equal(t, before+1, globalTotals(t, db).Jobs)
+	})
+
+	t.Run("Enqueue_KeyNeverFree", func(t *testing.T) {
+		db := beginTx(t, conn)
+		keepStealingKey(t, db, "default", "test.job", "taken-key")
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", IdempotencyKey: "taken-key"})
+		assert.ErrorIs(t, err, errEnqueueMissed)
+		assert.Empty(t, id)
+	})
+}
+
+func keepStealingKey(t testing.TB, db pgx.Tx, queue, jobType, key string) {
+	t.Helper()
+
+	_, err := db.Exec(t.Context(), fmt.Sprintf(`
+		CREATE FUNCTION "raptor_test_take_key"() RETURNS TRIGGER AS $$
+		BEGIN
+			IF pg_trigger_depth() = 1 THEN
+				INSERT INTO "raptor_jobs" ("queue_name", "job_type", "idempotency_key") VALUES (%[1]s, %[2]s, %[3]s);
+			END IF;
+			RETURN NULL;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE FUNCTION "raptor_test_free_key"() RETURNS TRIGGER AS $$
+		BEGIN
+			IF pg_trigger_depth() = 1 THEN
+				UPDATE "raptor_jobs" SET "status" = 'completed', "completed_at" = now()
+				WHERE "idempotency_key" = %[3]s AND "status" = 'pending';
+			END IF;
+			RETURN NULL;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER "raptor_test_take_key" BEFORE INSERT ON "raptor_jobs"
+		FOR EACH STATEMENT EXECUTE FUNCTION "raptor_test_take_key"();
+		CREATE TRIGGER "raptor_test_free_key" AFTER INSERT ON "raptor_jobs"
+		FOR EACH STATEMENT EXECUTE FUNCTION "raptor_test_free_key"();`,
+		quoteLiteral(queue), quoteLiteral(jobType), quoteLiteral(key)))
+	require.NoError(t, err)
+}
+
+func quoteLiteral(s string) string {
+	return "'" + strings.ReplaceAll(s, "'", "''") + "'"
+}
+
+func TestEnqueue_KeyFreedConcurrently(t *testing.T) {
+	pool := test.CreatePool(t)
+	require.NoError(t, SetupPool(t.Context(), pool))
+
+	const pauseLock = 0x7261_7074_0308
+	_, err := pool.Exec(t.Context(), fmt.Sprintf(`
+		CREATE FUNCTION "raptor_test_pause"() RETURNS TRIGGER AS $$
+		BEGIN
+			IF current_setting('raptor.test_pause', true) = 'on' THEN
+				PERFORM pg_advisory_xact_lock_shared(%d);
+			END IF;
+			RETURN NULL;
+		END;
+		$$ LANGUAGE plpgsql;
+		CREATE TRIGGER "raptor_test_pause" AFTER INSERT ON "raptor_jobs"
+		FOR EACH STATEMENT EXECUTE FUNCTION "raptor_test_pause"();`, pauseLock))
+	require.NoError(t, err)
+
+	job := EnqueueJob{Queue: "default", Type: "test.job", IdempotencyKey: "racy-key"}
+	firstID, err := Enqueue(t.Context(), pool, job)
+	require.NoError(t, err)
+
+	holder, err := pool.Acquire(t.Context())
+	require.NoError(t, err)
+	defer holder.Release()
+	_, err = holder.Exec(t.Context(), `SELECT pg_advisory_lock($1)`, pauseLock)
+	require.NoError(t, err)
+
+	enqueuer, err := pool.Acquire(t.Context())
+	require.NoError(t, err)
+	defer enqueuer.Release()
+	_, err = enqueuer.Exec(t.Context(), `SET raptor.test_pause = 'on'`)
+	require.NoError(t, err)
+
+	type result struct {
+		id  string
+		err error
+	}
+	done := make(chan result, 1)
+	go func() {
+		id, err := Enqueue(t.Context(), enqueuer, job)
+		done <- result{id, err}
+	}()
+
+	require.Eventually(t, func() bool {
+		var waiting bool
+		err := pool.QueryRow(t.Context(), `SELECT EXISTS (SELECT 1 FROM pg_locks WHERE "locktype" = 'advisory' AND NOT "granted")`).Scan(&waiting)
+		return err == nil && waiting
+	}, 5*time.Second, 10*time.Millisecond)
+
+	jobs, err := Claim(t.Context(), pool, "default", "worker-1", 1, time.Minute)
+	require.NoError(t, err)
+	require.Len(t, jobs, 1)
+	require.NoError(t, Complete(t.Context(), pool, jobs[0]))
+
+	_, err = holder.Exec(t.Context(), `SELECT pg_advisory_unlock($1)`, pauseLock)
+	require.NoError(t, err)
+
+	got := <-done
+	require.NoError(t, got.err)
+	assert.NotEmpty(t, got.id)
+	assert.NotEqual(t, firstID, got.id)
+	assert.Equal(t, int64(2), globalTotals(t, pool).Jobs)
+}
+
+func TestPermanent(t *testing.T) {
+	assert.NoError(t, Permanent(nil))
+
+	cause := errors.New("bad payload")
+	err := Permanent(cause)
+	assert.EqualError(t, err, "bad payload")
+	assert.ErrorIs(t, err, cause)
 }
 
 func TestBackoff(t *testing.T) {
