@@ -452,6 +452,18 @@ func TestRaptor(t *testing.T) {
 		assert.True(t, failedAtIndexed)
 	})
 
+	t.Run("TimeoutMsDropped", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		rows, err := db.Query(t.Context(), `
+			SELECT "table_name"::text FROM information_schema.columns
+			WHERE "table_name" IN ('raptor_jobs', 'raptor_dead_jobs') AND "column_name" = 'timeout_ms'`)
+		require.NoError(t, err)
+		tables, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		require.NoError(t, err)
+		assert.Empty(t, tables)
+	})
+
 	t.Run("Release", func(t *testing.T) {
 		db := beginTx(t, conn)
 
