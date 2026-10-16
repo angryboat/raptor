@@ -105,7 +105,7 @@ func TestRaptor(t *testing.T) {
 		require.NoError(t, err)
 
 		err = Complete(t.Context(), db, jobs[0])
-		assert.ErrorIs(t, err, ErrJobNotFound)
+		assert.ErrorIs(t, err, ErrClaimLost)
 	})
 
 	t.Run("Cancel", func(t *testing.T) {
@@ -306,7 +306,7 @@ func TestRaptor(t *testing.T) {
 		assert.Empty(t, jobs)
 
 		err = Fail(t.Context(), db, claimed[0], errors.New("boom again"))
-		assert.ErrorIs(t, err, ErrJobNotFound)
+		assert.ErrorIs(t, err, ErrClaimLost, "a dead job still exists")
 	})
 
 	t.Run("Release", func(t *testing.T) {
@@ -353,7 +353,7 @@ func TestRaptor(t *testing.T) {
 		assert.ErrorIs(t, Release(t.Context(), db, stale[0]), ErrClaimLost)
 
 		require.NoError(t, Complete(t.Context(), db, fresh[0]))
-		assert.ErrorIs(t, Release(t.Context(), db, fresh[0]), ErrJobNotFound)
+		assert.ErrorIs(t, Release(t.Context(), db, fresh[0]), ErrClaimLost)
 	})
 
 	t.Run("Sweep", func(t *testing.T) {
@@ -503,6 +503,84 @@ func TestRaptor(t *testing.T) {
 
 		err = Cleanup(t.Context(), db, "")
 		assert.NoError(t, err)
+	})
+
+	t.Run("Settle_Cancelled", func(t *testing.T) {
+		settles := map[string]func(DB, *Job) error{
+			"Complete": func(db DB, job *Job) error { return Complete(t.Context(), db, job) },
+			"Fail":     func(db DB, job *Job) error { return Fail(t.Context(), db, job, errors.New("boom")) },
+			"Release":  func(db DB, job *Job) error { return Release(t.Context(), db, job) },
+		}
+		for name, settle := range settles {
+			t.Run(name, func(t *testing.T) {
+				db := beginTx(t, conn)
+
+				id, err := Enqueue(t.Context(), db, EnqueueJob{
+					Queue: "default",
+					Type:  "test.job",
+				})
+				require.NoError(t, err)
+
+				jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+				require.NoError(t, err)
+				require.Len(t, jobs, 1)
+
+				require.NoError(t, Cancel(t.Context(), db, id))
+
+				assert.ErrorIs(t, settle(db, jobs[0]), ErrClaimLost)
+				assert.Equal(t, "cancelled", readJobState(t, db, id).Status)
+			})
+		}
+	})
+
+	t.Run("Settle_Missing", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue: "default",
+			Type:  "test.job",
+		})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+
+		_, err = db.Exec(t.Context(), `DELETE FROM "raptor_jobs" WHERE "id" = $1`, id)
+		require.NoError(t, err)
+
+		missing := &Job{ID: "00000000-0000-0000-0000-000000000000"}
+		for _, job := range []*Job{jobs[0], missing} {
+			assert.ErrorIs(t, Complete(t.Context(), db, job), ErrJobNotFound)
+			assert.ErrorIs(t, Fail(t.Context(), db, job, errors.New("boom")), ErrJobNotFound)
+			assert.ErrorIs(t, Release(t.Context(), db, job), ErrJobNotFound)
+		}
+	})
+
+	t.Run("ExecuteJob_Cancelled", func(t *testing.T) {
+		for name, worker := range map[string]*recordingWorker{
+			"Succeeds": {},
+			"Fails":    {err: errors.New("boom")},
+		} {
+			t.Run(name, func(t *testing.T) {
+				db := beginTx(t, conn)
+
+				id, err := Enqueue(t.Context(), db, EnqueueJob{
+					Queue: "default",
+					Type:  "test.job",
+				})
+				require.NoError(t, err)
+
+				jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+				require.NoError(t, err)
+				require.Len(t, jobs, 1)
+
+				require.NoError(t, Cancel(t.Context(), db, id))
+
+				assert.NoError(t, executeJob(t.Context(), db, worker, jobs[0]))
+				assert.Equal(t, "cancelled", readJobState(t, db, id).Status)
+			})
+		}
 	})
 
 	t.Run("Enqueue_Idempotent", func(t *testing.T) {

@@ -189,9 +189,15 @@ func executeJob(ctx context.Context, db DB, worker Worker, job *Job) error {
 	defer cancel()
 
 	if err != nil {
-		return Fail(ctx, db, job, err)
+		err = Fail(ctx, db, job, err)
+	} else {
+		err = Complete(ctx, db, job)
 	}
-	return Complete(ctx, db, job)
+	if errors.Is(err, ErrClaimLost) {
+		slog.InfoContext(ctx, "job claim lost before it settled", slog.String("job-id", job.ID), slog.String("job-type", job.Type), slog.String("queue", job.Queue))
+		return nil
+	}
+	return err
 }
 
 func runWorker(ctx context.Context, worker Worker, job *Job) (err error) {
