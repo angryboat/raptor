@@ -344,18 +344,20 @@ func TestRaptor(t *testing.T) {
 		var (
 			queue, jobType, status, claimedBy, reason string
 			attempts                                  int32
+			claimSeq                                  int64
 			failedAtIsNow                             bool
 		)
 		err = db.QueryRow(t.Context(), `
-			SELECT "queue_name", "job_type", "status"::text, "claimed_by", "attempts", "failed_at" = now(), "failure_info"->>'error'
+			SELECT "queue_name", "job_type", "status"::text, "claimed_by", "attempts", "claim_seq", "failed_at" = now(), "failure_info"->>'error'
 			FROM "raptor_dead_jobs" WHERE "id" = $1`, id).
-			Scan(&queue, &jobType, &status, &claimedBy, &attempts, &failedAtIsNow, &reason)
+			Scan(&queue, &jobType, &status, &claimedBy, &attempts, &claimSeq, &failedAtIsNow, &reason)
 		require.NoError(t, err)
 		assert.Equal(t, "default", queue)
 		assert.Equal(t, "test.job", jobType)
 		assert.Equal(t, "failed", status)
 		assert.Equal(t, "worker-1", claimedBy)
 		assert.Equal(t, int32(1), attempts)
+		assert.Equal(t, claimed[0].ClaimSeq, claimSeq)
 		assert.True(t, failedAtIsNow)
 		assert.Equal(t, "boom", reason)
 
@@ -594,6 +596,58 @@ func TestRaptor(t *testing.T) {
 		assert.ErrorIs(t, Release(t.Context(), db, fresh[0]), ErrClaimLost)
 	})
 
+	t.Run("Release_ReclaimBySameWorker", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", MaxAttempts: 3})
+		require.NoError(t, err)
+
+		stale, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, stale, 1)
+
+		require.NoError(t, Release(t.Context(), db, stale[0]))
+
+		fresh, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, fresh, 1)
+		require.Equal(t, id, fresh[0].ID)
+		require.Equal(t, stale[0].Attempts, fresh[0].Attempts)
+
+		assert.ErrorIs(t, Complete(t.Context(), db, stale[0]), ErrClaimLost)
+		assert.ErrorIs(t, Fail(t.Context(), db, stale[0], errors.New("late")), ErrClaimLost)
+		assert.ErrorIs(t, Release(t.Context(), db, stale[0]), ErrClaimLost)
+		assert.Equal(t, jobState{Status: "claimed", Attempts: 1}, readJobState(t, db, id))
+
+		require.NoError(t, Complete(t.Context(), db, fresh[0]))
+	})
+
+	t.Run("Fail_DeadIDReused", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", MaxAttempts: 1})
+		require.NoError(t, err)
+
+		stale, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, stale, 1)
+		require.NoError(t, Fail(t.Context(), db, stale[0], errors.New("boom")))
+
+		_, err = db.Exec(t.Context(), `INSERT INTO "raptor_jobs" ("id", "queue_name", "job_type", "max_attempts") VALUES ($1, 'default', 'test.job', 1)`, id)
+		require.NoError(t, err)
+
+		fresh, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, fresh, 1)
+		require.Equal(t, id, fresh[0].ID)
+
+		assert.NotEqual(t, stale[0].ClaimSeq, fresh[0].ClaimSeq)
+		assert.ErrorIs(t, Complete(t.Context(), db, stale[0]), ErrClaimLost)
+		assert.Equal(t, jobState{Status: "claimed", Attempts: 1}, readJobState(t, db, id))
+
+		require.NoError(t, Complete(t.Context(), db, fresh[0]))
+	})
+
 	t.Run("Sweep", func(t *testing.T) {
 		// Not tx-scoped like its siblings: Sweep's expiry check compares
 		// claimed_at against now(), and now() is pinned to the transaction's
@@ -646,7 +700,7 @@ func TestRaptor(t *testing.T) {
 		require.Len(t, jobs, 1)
 		stale := jobs[0]
 
-		_, err = db.Exec(t.Context(), `SELECT "raptor_fail_job"($1, $2, $3, '{"error":"claim timeout"}'::jsonb)`, id, *stale.ClaimedBy, stale.Attempts)
+		_, err = db.Exec(t.Context(), `SELECT "raptor_fail_job"($1, $2, $3, '{"error":"claim timeout"}'::jsonb)`, id, *stale.ClaimedBy, stale.ClaimSeq)
 		require.NoError(t, err)
 
 		jobs, err = Claim(t.Context(), db, "default", "worker-2", 1, time.Minute)
@@ -659,8 +713,8 @@ func TestRaptor(t *testing.T) {
 		assert.ErrorIs(t, Fail(t.Context(), db, stale, errors.New("late")), ErrClaimLost)
 
 		sameWorker := *fresh
-		sameWorker.Attempts = stale.Attempts
-		assert.ErrorIs(t, Complete(t.Context(), db, &sameWorker), ErrClaimLost, "attempts must fence a worker that reclaims its own job")
+		sameWorker.ClaimSeq = stale.ClaimSeq
+		assert.ErrorIs(t, Complete(t.Context(), db, &sameWorker), ErrClaimLost, "claim_seq must fence a worker that reclaims its own job")
 
 		require.NoError(t, Complete(t.Context(), db, fresh))
 	})
