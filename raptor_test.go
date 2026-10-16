@@ -622,6 +622,32 @@ func TestRaptor(t *testing.T) {
 		require.NoError(t, Complete(t.Context(), db, fresh[0]))
 	})
 
+	t.Run("Fail_DeadIDReused", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", MaxAttempts: 1})
+		require.NoError(t, err)
+
+		stale, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, stale, 1)
+		require.NoError(t, Fail(t.Context(), db, stale[0], errors.New("boom")))
+
+		_, err = db.Exec(t.Context(), `INSERT INTO "raptor_jobs" ("id", "queue_name", "job_type", "max_attempts") VALUES ($1, 'default', 'test.job', 1)`, id)
+		require.NoError(t, err)
+
+		fresh, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, fresh, 1)
+		require.Equal(t, id, fresh[0].ID)
+
+		assert.NotEqual(t, stale[0].ClaimSeq, fresh[0].ClaimSeq)
+		assert.ErrorIs(t, Complete(t.Context(), db, stale[0]), ErrClaimLost)
+		assert.Equal(t, jobState{Status: "claimed", Attempts: 1}, readJobState(t, db, id))
+
+		require.NoError(t, Complete(t.Context(), db, fresh[0]))
+	})
+
 	t.Run("Sweep", func(t *testing.T) {
 		// Not tx-scoped like its siblings: Sweep's expiry check compares
 		// claimed_at against now(), and now() is pinned to the transaction's

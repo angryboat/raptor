@@ -96,9 +96,9 @@ the runner to settle jobs after the timeout.
   still exists but the caller's claim no longer holds: it was reaped,
   reclaimed, cancelled, already settled or moved to `raptor_dead_jobs`. They
   return `ErrJobNotFound` only when raptor has no record of the job, because
-  it never existed or `Cleanup` deleted it. Every claim gets a new
-  `ClaimSeq`, so a `Job` from an earlier claim loses even when the same
-  worker reclaims the job after `Release`. Runners log a lost claim at info
+  it never existed or `Cleanup` deleted it. Every claim draws a new
+  `ClaimSeq` from one database-wide sequence, so a `Job` from an earlier
+  claim loses even when the same worker reclaims the job after `Release`. Runners log a lost claim at info
   level and move on, so cancelling a running job doesn't surface as an error.
   Claim TTLs are whole seconds, so `Claim` rounds its timeout up: 500ms claims
   for one second and 1.5s for two.

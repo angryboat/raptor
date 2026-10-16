@@ -5,6 +5,9 @@ ALTER TABLE "raptor_dead_jobs" ADD COLUMN "claim_seq" BIGINT NOT NULL DEFAULT 0;
 -- Seeding from attempts keeps claims taken before this migration settleable by callers that still pass attempts.
 UPDATE "raptor_jobs" SET "claim_seq" = "attempts" WHERE "status" IN ('pending', 'claimed');
 
+-- One sequence for every row, so a job re-inserted under a reused id can't repeat an old fence; it starts above any INT attempts seeded above.
+CREATE SEQUENCE "raptor_claim_seq" AS BIGINT START WITH 2147483648;
+
 CREATE OR REPLACE FUNCTION "raptor_claim_jobs"(
   p_queue VARCHAR(64),
   p_worker_id VARCHAR(64),
@@ -29,7 +32,7 @@ BEGIN
         "claimed_by" = p_worker_id,
         "claimed_ttl" = COALESCE(p_claimed_ttl, j."claimed_ttl"),
         "attempts" = j."attempts" + 1,
-        "claim_seq" = j."claim_seq" + 1
+        "claim_seq" = nextval('"raptor_claim_seq"')
     FROM "claimed_jobs" cj
     WHERE j."id" = cj."id"
     RETURNING j.*;
