@@ -228,7 +228,13 @@ func ttlSeconds(d time.Duration) int32 {
 	if d%time.Second > 0 {
 		secs++
 	}
-	return int32(min(secs, math.MaxInt32))
+	switch {
+	case secs <= 0:
+		return 0
+	case secs > math.MaxInt32:
+		return math.MaxInt32
+	}
+	return int32(secs)
 }
 
 // Complete marks a claimed job as completed. It returns ErrClaimLost if the

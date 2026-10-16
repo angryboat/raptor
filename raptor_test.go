@@ -581,6 +581,8 @@ func TestBackoff(t *testing.T) {
 
 func TestTTLSeconds(t *testing.T) {
 	for d, want := range map[time.Duration]int32{
+		-time.Second:                  0,
+		0:                             0,
 		time.Nanosecond:               1,
 		999 * time.Millisecond:        1,
 		time.Second:                   1,
