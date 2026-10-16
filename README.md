@@ -51,7 +51,9 @@ return runner.Run(ctx, pool)
 
 `Run` blocks until `ctx` is cancelled, then finishes the jobs it's already
 running. Each round it takes up to a queue's weight in jobs, starting with the
-highest-weight queue. `SerialRunner` empties its queues one job at a time and
+highest-weight queue. It claims a job only when one of its `Threads` workers
+is free to start it, so a claim's deadline never runs out while the job waits
+in line. `SerialRunner` empties its queues one job at a time and
 then returns, which is handy for tests and scripts.
 
 ## Jobs

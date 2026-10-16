@@ -26,7 +26,7 @@ func TestConcurrentWeightedRunner_Dequeue(t *testing.T) {
 		r.Threads = 10 // larger than either weight, so batching can't hide an over-claim
 
 		jobs := make(chan *Job, 10)
-		err := r.dequeue(t.Context(), db, jobs)
+		err := r.dequeue(t.Context(), db, newIdleWorkers(r.Threads), jobs)
 		require.NoError(t, err)
 		close(jobs)
 
@@ -48,7 +48,7 @@ func TestConcurrentWeightedRunner_Dequeue(t *testing.T) {
 		r.Threads = 4
 
 		jobs := make(chan *Job, 10)
-		err := r.dequeue(t.Context(), db, jobs)
+		err := r.dequeue(t.Context(), db, newIdleWorkers(r.Threads), jobs)
 		require.NoError(t, err)
 		close(jobs)
 
@@ -68,7 +68,7 @@ func TestConcurrentWeightedRunner_Dequeue(t *testing.T) {
 
 		jobs := make(chan *Job, 1)
 		start := time.Now()
-		err := r.dequeue(t.Context(), db, jobs)
+		err := r.dequeue(t.Context(), db, newIdleWorkers(1), jobs)
 		elapsed := time.Since(start)
 
 		require.NoError(t, err)
@@ -89,7 +89,7 @@ func TestConcurrentWeightedRunner_Dequeue(t *testing.T) {
 
 		jobs := make(chan *Job, 1)
 		start := time.Now()
-		err := r.dequeue(ctx, db, jobs)
+		err := r.dequeue(ctx, db, newIdleWorkers(1), jobs)
 		elapsed := time.Since(start)
 
 		require.NoError(t, err)
@@ -220,6 +220,35 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 		assert.Equal(t, jobState{Status: "completed", Attempts: 1}, readJobState(t, db, ids[0]))
 	})
 
+	t.Run("ClaimsNoMoreThanIdleWorkers", func(t *testing.T) {
+		const queue = "run-claims-idle"
+		const threads = 2
+		enqueueN(t, db, queue, 3*threads)
+
+		worker := newBlockingWorker()
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 10}, map[string]Worker{"test.job": worker})
+		r.Threads = threads
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		for range threads {
+			worker.awaitStart(t)
+		}
+
+		assert.Never(t, func() bool {
+			return countClaimed(t, db, queue) > threads
+		}, 200*time.Millisecond, 10*time.Millisecond, "runner claimed jobs no worker was free to start")
+
+		cancel()
+		close(worker.unblock)
+		require.NoError(t, <-done)
+	})
+
 	t.Run("CancelReleasesUnstartedJobs", func(t *testing.T) {
 		const queue = "run-cancel-unstarted"
 		ids := enqueueN(t, db, queue, 3)
@@ -236,11 +265,7 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 		go func() { done <- r.Run(ctx, db) }()
 
 		started := worker.awaitStart(t)
-
-		// One job executing, one in the channel buffer, one held by drainQueue.
-		require.Eventually(t, func() bool {
-			return countClaimed(t, db, queue) == 3
-		}, 3*time.Second, 10*time.Millisecond, "runner never claimed every job")
+		require.Equal(t, 1, countClaimed(t, db, queue), "only the running job should be claimed")
 
 		cancel()
 		close(worker.unblock)

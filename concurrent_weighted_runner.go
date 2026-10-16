@@ -40,12 +40,13 @@ func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
 	ctx, cancel := context.WithCancelCause(parent)
 	defer cancel(nil)
 
-	jobs := make(chan *Job, c.Threads)
+	idle := newIdleWorkers(c.Threads)
+	jobs := make(chan *Job)
 
 	go func() {
 		defer close(jobs)
 		for ctx.Err() == nil && !c.quiet.Load() {
-			if err := c.dequeue(ctx, db, jobs); err != nil {
+			if err := c.dequeue(ctx, db, idle, jobs); err != nil {
 				cancel(err)
 				return
 			}
@@ -58,9 +59,10 @@ func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
 			for job := range jobs {
 				if ctx.Err() != nil {
 					c.release(ctx, db, job)
-					continue
+				} else {
+					c.execute(ctx, db, job)
 				}
-				c.execute(ctx, db, job)
+				idle.put(1)
 			}
 		})
 	}
@@ -82,7 +84,7 @@ func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
 // highest weight first (ties broken by name for determinism). If nothing
 // was claimed this round, it waits out emptyCooldown before returning so
 // the caller's loop doesn't spin.
-func (c *ConcurrentWeightedRunner) dequeue(ctx context.Context, db DB, queue chan<- *Job) error {
+func (c *ConcurrentWeightedRunner) dequeue(ctx context.Context, db DB, idle idleWorkers, queue chan<- *Job) error {
 	names := make([]string, 0, len(c.Queue))
 	for name := range c.Queue {
 		names = append(names, name)
@@ -102,7 +104,7 @@ func (c *ConcurrentWeightedRunner) dequeue(ctx context.Context, db DB, queue cha
 			continue
 		}
 
-		n, err := c.drainQueue(ctx, db, name, weight, queue)
+		n, err := c.drainQueue(ctx, db, name, weight, idle, queue)
 		if err != nil {
 			return err
 		}
@@ -121,22 +123,25 @@ func (c *ConcurrentWeightedRunner) dequeue(ctx context.Context, db DB, queue cha
 	return nil
 }
 
-// drainQueue claims up to max jobs from the named queue, in batches of
-// c.Threads at a time, and hands each claimed job to the queue channel.
-// It stops early if the queue runs dry before max is reached.
-func (c *ConcurrentWeightedRunner) drainQueue(ctx context.Context, db DB, name string, max int, queue chan<- *Job) (int, error) {
+// drainQueue claims up to max jobs from the named queue and hands each
+// claimed job to the queue channel. Each batch is sized to the number of
+// idle workers, waiting for at least one, so the runner never holds a claimed
+// job that no worker is free to start. It stops early if the queue runs dry
+// before max is reached.
+func (c *ConcurrentWeightedRunner) drainQueue(ctx context.Context, db DB, name string, max int, idle idleWorkers, queue chan<- *Job) (int, error) {
 	claimed := 0
 	for claimed < max {
 		if err := ctx.Err(); err != nil {
 			return claimed, err
 		}
 
-		limit := c.Threads
-		if remaining := max - claimed; remaining < limit {
-			limit = remaining
+		limit := idle.take(ctx, max-claimed)
+		if limit == 0 {
+			return claimed, ctx.Err()
 		}
 
 		jobs, err := Claim(ctx, db, name, c.id, limit, 0)
+		idle.put(limit - len(jobs))
 		if err != nil {
 			return claimed, err
 		}
@@ -156,6 +161,39 @@ func (c *ConcurrentWeightedRunner) drainQueue(ctx context.Context, db DB, name s
 	}
 
 	return claimed, nil
+}
+
+type idleWorkers chan struct{}
+
+func newIdleWorkers(n int) idleWorkers {
+	idle := make(idleWorkers, n)
+	idle.put(n)
+	return idle
+}
+
+func (w idleWorkers) take(ctx context.Context, max int) int {
+	select {
+	case <-ctx.Done():
+		return 0
+	case <-w:
+	}
+
+	n := 1
+	for n < max {
+		select {
+		case <-w:
+			n++
+		default:
+			return n
+		}
+	}
+	return n
+}
+
+func (w idleWorkers) put(n int) {
+	for range n {
+		w <- struct{}{}
+	}
 }
 
 func (c *ConcurrentWeightedRunner) execute(ctx context.Context, db DB, job *Job) {
