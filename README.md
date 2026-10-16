@@ -106,6 +106,17 @@ Call these on a timer, or from a scheduled job:
 `LoadQueueStat` reports completed, failed, cancelled and dead counts for each
 job type in a queue.
 
+## Dashboard
+
+`dashboard.New` returns an `http.Handler` that renders a read-only page of
+queue depths and lifetime counts, running, retrying and dead jobs, and each
+schedule's next run. Turn on its Live toggle to refresh every 5 seconds. It
+does no authentication, so wrap it in your own middleware.
+
+```go
+mux.Handle("/raptor/", http.StripPrefix("/raptor", requireAdmin(password, dashboard.New(pool))))
+```
+
 ## Development
 
 ```sh
