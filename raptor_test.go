@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/angryboat/raptor/internal/test"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -43,6 +44,13 @@ func TestRaptor(t *testing.T) {
 		// migrate.Up tracks applied migrations, so re-running Setup against an
 		// already-migrated DB should be a no-op, not an error.
 		assert.NoError(t, Setup(t.Context(), conn))
+	})
+
+	t.Run("Setup_DropsFailedJobs", func(t *testing.T) {
+		var exists bool
+		err := conn.QueryRow(t.Context(), `SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'raptor_failed_jobs')`).Scan(&exists)
+		require.NoError(t, err)
+		assert.False(t, exists)
 	})
 
 	t.Run("Enqueue", func(t *testing.T) {
@@ -85,6 +93,37 @@ func TestRaptor(t *testing.T) {
 		more, err := Claim(t.Context(), db, "default", "worker-2", 1, time.Minute)
 		require.NoError(t, err)
 		assert.Empty(t, more)
+	})
+
+	t.Run("Claim rounds timeout up to whole seconds", func(t *testing.T) {
+		for timeout, ttl := range map[time.Duration]int32{
+			time.Nanosecond:         1,
+			500 * time.Millisecond:  1,
+			time.Second:             1,
+			1900 * time.Millisecond: 2,
+			0:                       300,
+			-time.Second:            300,
+		} {
+			t.Run(timeout.String(), func(t *testing.T) {
+				db := beginTx(t, conn)
+
+				_, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job"})
+				require.NoError(t, err)
+
+				jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, timeout)
+				require.NoError(t, err)
+				require.Len(t, jobs, 1)
+
+				job := jobs[0]
+				assert.Equal(t, ttl, job.ClaimedTTL)
+				require.NotNil(t, job.ClaimedAt)
+				assert.Equal(t, job.ClaimedAt.Add(time.Duration(ttl)*time.Second), job.ClaimDeadline())
+
+				var reaped int
+				require.NoError(t, db.QueryRow(t.Context(), `SELECT "raptor_reap_stuck_jobs"()`).Scan(&reaped))
+				assert.Zero(t, reaped)
+			})
+		}
 	})
 
 	t.Run("Complete", func(t *testing.T) {
@@ -301,12 +340,128 @@ func TestRaptor(t *testing.T) {
 		err = Fail(t.Context(), db, claimed[0], errors.New("boom"))
 		require.NoError(t, err)
 
+		var (
+			queue, jobType, status, claimedBy, reason string
+			attempts                                  int32
+			failedAtIsNow                             bool
+		)
+		err = db.QueryRow(t.Context(), `
+			SELECT "queue_name", "job_type", "status"::text, "claimed_by", "attempts", "failed_at" = now(), "failure_info"->>'error'
+			FROM "raptor_dead_jobs" WHERE "id" = $1`, id).
+			Scan(&queue, &jobType, &status, &claimedBy, &attempts, &failedAtIsNow, &reason)
+		require.NoError(t, err)
+		assert.Equal(t, "default", queue)
+		assert.Equal(t, "test.job", jobType)
+		assert.Equal(t, "failed", status)
+		assert.Equal(t, "worker-1", claimedBy)
+		assert.Equal(t, int32(1), attempts)
+		assert.True(t, failedAtIsNow)
+		assert.Equal(t, "boom", reason)
+
+		var live bool
+		require.NoError(t, db.QueryRow(t.Context(), `SELECT EXISTS (SELECT 1 FROM "raptor_jobs" WHERE "id" = $1)`, id).Scan(&live))
+		assert.False(t, live)
+
 		jobs, err := Claim(t.Context(), db, "default", "worker-2", 1, time.Minute)
 		require.NoError(t, err)
 		assert.Empty(t, jobs)
 
 		err = Fail(t.Context(), db, claimed[0], errors.New("boom again"))
 		assert.ErrorIs(t, err, ErrClaimLost, "a dead job still exists")
+	})
+
+	t.Run("Fail_Dead_AddedColumn", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		_, err := db.Exec(t.Context(), `ALTER TABLE "raptor_jobs" ADD COLUMN "test_added" TEXT NOT NULL DEFAULT 'added'`)
+		require.NoError(t, err)
+		// A statement cached by an earlier subtest keeps the old row shape and would hide a SELECT * regression.
+		require.NoError(t, conn.DeallocateAll(t.Context()))
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:       "default",
+			Type:        "test.job",
+			Payload:     map[string]any{"foo": "bar"},
+			MaxAttempts: 1,
+		})
+		require.NoError(t, err)
+
+		claimed, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+
+		job := claimed[0]
+		assert.Equal(t, id, job.ID)
+		assert.Equal(t, "test.job", job.Type)
+		assert.JSONEq(t, `{"foo":"bar"}`, string(job.Payload))
+		assert.Equal(t, int32(1), job.Attempts)
+
+		require.NoError(t, Fail(t.Context(), db, job, errors.New("boom")))
+
+		var status, reason string
+		err = db.QueryRow(t.Context(), `SELECT "status"::text, "failure_info"->>'error' FROM "raptor_dead_jobs" WHERE "id" = $1`, id).Scan(&status, &reason)
+		require.NoError(t, err)
+		assert.Equal(t, "failed", status)
+		assert.Equal(t, "boom", reason)
+	})
+
+	t.Run("Fail_Dead_ReusedID", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		var id string
+		err := db.QueryRow(t.Context(), `
+			INSERT INTO "raptor_dead_jobs" ("queue_name", "job_type", "status", "failed_at", "failure_info")
+			VALUES ('reused', 'test.job', 'failed', now() - INTERVAL '1 day', '{"error":"first"}')
+			RETURNING "id"`).Scan(&id)
+		require.NoError(t, err)
+
+		_, err = db.Exec(t.Context(), `INSERT INTO "raptor_jobs" ("id", "queue_name", "job_type", "max_attempts") VALUES ($1, 'reused', 'test.job', 1)`, id)
+		require.NoError(t, err)
+
+		claimed, err := Claim(t.Context(), db, "reused", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+
+		require.NoError(t, Fail(t.Context(), db, claimed[0], errors.New("second")))
+
+		rows, err := db.Query(t.Context(), `SELECT "failure_info"->>'error' FROM "raptor_dead_jobs" WHERE "id" = $1`, id)
+		require.NoError(t, err)
+		reasons, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		require.NoError(t, err)
+		assert.Equal(t, []string{"second"}, reasons)
+	})
+
+	t.Run("DeadJobs_Indexes", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		var pkey string
+		err := db.QueryRow(t.Context(), `
+			SELECT pg_get_constraintdef("oid") FROM pg_constraint
+			WHERE "conrelid" = '"raptor_dead_jobs"'::regclass AND "contype" = 'p'`).Scan(&pkey)
+		require.NoError(t, err)
+		assert.Equal(t, "PRIMARY KEY (id)", pkey)
+
+		var failedAtIndexed bool
+		err = db.QueryRow(t.Context(), `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_index i
+				JOIN pg_attribute a ON a."attrelid" = i."indrelid" AND a."attnum" = i."indkey"[0]
+				WHERE i."indrelid" = '"raptor_dead_jobs"'::regclass AND a."attname" = 'failed_at'
+			)`).Scan(&failedAtIndexed)
+		require.NoError(t, err)
+		assert.True(t, failedAtIndexed)
+	})
+
+	t.Run("TimeoutMsDropped", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		rows, err := db.Query(t.Context(), `
+			SELECT "table_name"::text FROM information_schema.columns
+			WHERE "table_name" IN ('raptor_jobs', 'raptor_dead_jobs') AND "column_name" = 'timeout_ms'`)
+		require.NoError(t, err)
+		tables, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		require.NoError(t, err)
+		assert.Empty(t, tables)
 	})
 
 	t.Run("Release", func(t *testing.T) {
@@ -583,6 +738,38 @@ func TestRaptor(t *testing.T) {
 		}
 	})
 
+	t.Run("Cleanup_DeadJobs", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		insertDead := func(queue, age string) string {
+			var id string
+			err := db.QueryRow(t.Context(), `
+				INSERT INTO "raptor_dead_jobs" ("queue_name", "job_type", "status", "failed_at")
+				VALUES ($1, 'test.job', 'failed', now() - $2::interval)
+				RETURNING "id"`, queue, age).Scan(&id)
+			require.NoError(t, err)
+			return id
+		}
+		remaining := func() []string {
+			rows, err := db.Query(t.Context(), `SELECT "id"::text FROM "raptor_dead_jobs" WHERE "queue_name" LIKE 'dead-%'`)
+			require.NoError(t, err)
+			ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			require.NoError(t, err)
+			return ids
+		}
+
+		insertDead("dead-a", "31 days")
+		insertDead("dead-a", "30 days")
+		recent := insertDead("dead-a", "29 days")
+		otherQueue := insertDead("dead-b", "31 days")
+
+		require.NoError(t, Cleanup(t.Context(), db, "dead-a"))
+		assert.ElementsMatch(t, []string{recent, otherQueue}, remaining())
+
+		require.NoError(t, Cleanup(t.Context(), db, ""))
+		assert.ElementsMatch(t, []string{recent}, remaining())
+	})
+
 	t.Run("Enqueue_Idempotent", func(t *testing.T) {
 		db := beginTx(t, conn)
 
@@ -616,5 +803,22 @@ func TestBackoff(t *testing.T) {
 			assert.GreaterOrEqual(t, delay, ceiling/2, "attempts %d", attempts)
 			assert.LessOrEqual(t, delay, ceiling, "attempts %d", attempts)
 		}
+	}
+}
+
+func TestTTLSeconds(t *testing.T) {
+	for d, want := range map[time.Duration]int32{
+		-time.Second:                  0,
+		0:                             0,
+		time.Nanosecond:               1,
+		999 * time.Millisecond:        1,
+		time.Second:                   1,
+		time.Second + time.Nanosecond: 2,
+		time.Minute:                   60,
+		math.MaxInt32 * time.Second:   math.MaxInt32,
+		(math.MaxInt32-1)*time.Second + time.Nanosecond: math.MaxInt32,
+		time.Duration(math.MaxInt64):                    math.MaxInt32,
+	} {
+		assert.Equal(t, want, ttlSeconds(d), "duration %s", d)
 	}
 }

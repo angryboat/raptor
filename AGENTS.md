@@ -38,12 +38,24 @@ API; this file covers how to change it safely.
   `NNNNNN_description.sql` instead, with the name minus `.sql` at most 32
   characters. Each file runs in one transaction. To change a function, use
   `CREATE OR REPLACE` in a new migration.
+- Name columns when Go scans a job row or SQL copies one between tables, never
+  `SELECT *`; `ADD COLUMN` appends, so positions drift.
+  `raptor_dead_jobs` was created with `LIKE "raptor_jobs"` and doesn't follow
+  later changes, so a migration that adds a column to `raptor_jobs` must add it
+  to `raptor_dead_jobs` too, add it to the column lists in `raptor_fail_job`'s
+  dead-job move, and add a tagged field to `Job` plus an entry in
+  `jobColumns` if Go should read it.
 - Prefix every table, type and function with `raptor_`, and double-quote
   identifiers.
 - Correctness under concurrency depends on row locks (`FOR UPDATE SKIP LOCKED`)
   and on fencing: `Complete`, `Fail` and `Release` only apply when
   `claimed_by` and `attempts` match the caller's claim. Keep both. A settle
   that misses must report `CLAIM_LOST` or `NOT_FOUND`.
+- Stats are append-only. `raptor_bump_stats` and writes to the
+  `raptor_job_stats` view insert event rows, which `raptor_rollup_stats` (run
+  by `Cleanup`) folds into `raptor_stats` and `raptor_job_stat_rollups`. Never
+  update a shared counter row on a state change: a caller's open transaction
+  would hold its lock.
 - For any time that more than one process compares, use the database clock
   (`now()`), not Go's.
 - Accept the narrowest interface: `DB` (only `Query`) or `TxDB` (adds
