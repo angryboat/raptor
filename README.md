@@ -85,8 +85,14 @@ return scheduler.Run(ctx, pool)
 ```
 
 Specs are cron expressions, descriptors like `@daily`, or `@every <duration>`,
-in UTC unless prefixed with `CRON_TZ=`. Removing a schedule from code deletes it
-on the next boot.
+in UTC unless prefixed with `CRON_TZ=`. `Run` wakes when a schedule is due and
+otherwise checks every `Interval` (one minute by default).
+
+A stored schedule is identified by its name and spec, so changing either makes
+a new schedule. During a rolling deploy, old and new replicas each run their
+own version of a changed schedule, so it may fire on both cadences until the
+old replicas stop. Once a schedule is an hour overdue, no replica is running
+it, and the next boot of any replica deletes it.
 
 ## Maintenance
 

@@ -6,9 +6,9 @@ import (
 	"errors"
 	"time"
 
+	"github.com/angryboat/raptor/internal/migrate"
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgxpool"
-	"github.com/angryboat/raptor/internal/migrate"
 )
 
 func Setup(ctx context.Context, conn *pgx.Conn) error {
@@ -67,41 +67,61 @@ type EnqueueJob struct {
 	IdempotencyKey string
 }
 
-func Enqueue(ctx context.Context, db DB, job EnqueueJob) (string, error) {
+type enqueueParams struct {
+	queue          string
+	jobType        string
+	payload        json.RawMessage
+	priority       int16
+	visibleAt      *time.Time
+	expiresAt      *time.Time
+	maxAttempts    int32
+	idempotencyKey *string
+}
+
+func newEnqueueParams(job EnqueueJob) (enqueueParams, error) {
 	payload, err := json.Marshal(job.Payload)
+	if err != nil {
+		return enqueueParams{}, err
+	}
+
+	p := enqueueParams{
+		queue:       job.Queue,
+		jobType:     job.Type,
+		payload:     payload,
+		priority:    job.Priority,
+		maxAttempts: job.MaxAttempts,
+	}
+	if !job.VisibleAt.IsZero() {
+		p.visibleAt = &job.VisibleAt
+	}
+	if !job.ExpiresAt.IsZero() {
+		p.expiresAt = &job.ExpiresAt
+	}
+	if p.maxAttempts <= 0 {
+		p.maxAttempts = 10
+	}
+	if job.IdempotencyKey != "" {
+		p.idempotencyKey = &job.IdempotencyKey
+	}
+
+	return p, nil
+}
+
+func Enqueue(ctx context.Context, db DB, job EnqueueJob) (string, error) {
+	p, err := newEnqueueParams(job)
 	if err != nil {
 		return "", err
 	}
 
-	var visibleAt any
-	if !job.VisibleAt.IsZero() {
-		visibleAt = job.VisibleAt
-	}
-
-	var expiresAt any
-	if !job.ExpiresAt.IsZero() {
-		expiresAt = job.ExpiresAt
-	}
-
-	maxAttempts := job.MaxAttempts
-	if maxAttempts <= 0 {
-		maxAttempts = 10
-	}
-
-	var idempotencyKey any
-	if job.IdempotencyKey != "" {
-		idempotencyKey = job.IdempotencyKey
-	}
-
 	rows, err := db.Query(ctx, `SELECT "raptor_enqueue_job"($1, $2, $3, $4, $5, $6, $7, $8)`,
-		job.Queue,
-		job.Type,
-		payload,
-		job.Priority,
-		visibleAt,
-		expiresAt,
-		maxAttempts,
-		idempotencyKey,
+		p.queue,
+		p.jobType,
+		p.payload,
+		p.priority,
+		p.visibleAt,
+		p.expiresAt,
+		p.maxAttempts,
+		p.idempotencyKey,
 	)
 	if err != nil {
 		return "", err
