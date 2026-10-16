@@ -54,7 +54,25 @@ func TestSerialRunner(t *testing.T) {
 		err = r.Execute(t.Context(), db)
 		require.NoError(t, err)
 
-		assert.True(t, isDead(t, db, id))
+		assert.Equal(t, missingWorkerFailure, deadFailure(t, db, id))
+	})
+
+	t.Run("Execute_NilWorkerRegistered", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:       "default",
+			Type:        "missing.type",
+			MaxAttempts: 1,
+		})
+		require.NoError(t, err)
+
+		r := NewSerialRunner([]string{"default"}, map[string]Worker{"missing.type": nil})
+
+		err = r.Execute(t.Context(), db)
+		require.NoError(t, err)
+
+		assert.Equal(t, missingWorkerFailure, deadFailure(t, db, id))
 	})
 
 	t.Run("Execute_WorkerError", func(t *testing.T) {
@@ -131,6 +149,100 @@ func TestSerialRunner(t *testing.T) {
 
 		require.True(t, hasDeadline)
 		assert.Equal(t, claimEnds, deadline)
+	})
+
+	t.Run("Execute_CancelWaitsForRunningJob", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		ids := enqueueN(t, db, "default", 2)
+
+		worker := newBlockingWorker()
+		r := NewSerialRunner([]string{"default"}, map[string]Worker{"test.job": worker})
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Execute(ctx, db) }()
+
+		started := worker.awaitStart(t)
+		cancel()
+
+		select {
+		case <-done:
+			t.Fatal("Execute returned before the running job finished")
+		case <-time.After(50 * time.Millisecond):
+		}
+
+		close(worker.unblock)
+		require.ErrorIs(t, <-done, context.Canceled)
+
+		for _, id := range ids {
+			want := jobState{Status: "pending", Attempts: 0}
+			if id == started.ID {
+				want = jobState{Status: "completed", Attempts: 1}
+			}
+			assert.Equal(t, want, readJobState(t, db, id), "job %s", id)
+		}
+	})
+
+	t.Run("Execute_ShutdownTimeoutReleasesRunningJob", func(t *testing.T) {
+		const timeout = 100 * time.Millisecond
+		db := beginTx(t, conn)
+
+		ids := enqueueN(t, db, "default", 1)
+
+		worker := newBlockingWorker()
+		r := NewSerialRunner([]string{"default"}, map[string]Worker{"test.job": worker})
+		r.ShutdownTimeout = timeout
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Execute(ctx, db) }()
+
+		worker.awaitStart(t)
+		cancel()
+		cancelled := time.Now()
+
+		select {
+		case err := <-done:
+			require.ErrorIs(t, err, context.Canceled)
+		case <-time.After(3 * time.Second):
+			t.Fatal("Execute never returned after the shutdown timeout")
+		}
+
+		assert.GreaterOrEqual(t, time.Since(cancelled), timeout)
+		assert.Equal(t, jobState{Status: "pending", Attempts: 0}, readJobState(t, db, ids[0]))
+	})
+
+	t.Run("ExecuteJob_ClaimDeadlineFailsJob", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		ids := enqueueN(t, db, "default", 1)
+		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, 0)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+
+		job := jobs[0]
+		expired := job.ClaimedAt.Add(-time.Hour)
+		job.ClaimedAt = &expired
+
+		require.NoError(t, executeJob(t.Context(), db, newBlockingWorker(), job))
+		assert.Equal(t, jobState{Status: "pending", Attempts: 1}, readJobState(t, db, ids[0]))
+	})
+
+	t.Run("Execute_NegativeShutdownTimeout", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		enqueueN(t, db, "default", 1)
+
+		r := NewSerialRunner([]string{"default"}, nil)
+		r.ShutdownTimeout = -time.Second
+
+		assert.EqualError(t, r.Execute(t.Context(), db), "raptor: shutdown timeout -1s must not be negative")
+		assert.Zero(t, countClaimed(t, db, "default"))
 	})
 
 	t.Run("Execute_EmptyQueueList", func(t *testing.T) {

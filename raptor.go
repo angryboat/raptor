@@ -373,15 +373,15 @@ func Cleanup(ctx context.Context, db DB, queue string) error {
 		q = queue
 	}
 
-	rows, err := db.Query(ctx, `SELECT "raptor_cleanup_jobs"($1)`, q)
+	rows, err := db.Query(ctx, `SELECT "raptor_cleanup_jobs"($1), "raptor_rollup_stats"()`, q)
 	if err != nil {
 		return err
 	}
 	defer rows.Close()
 
 	if rows.Next() {
-		var deleted int32
-		if err := rows.Scan(&deleted); err != nil {
+		var deleted, rolledUp int32
+		if err := rows.Scan(&deleted, &rolledUp); err != nil {
 			return err
 		}
 	}

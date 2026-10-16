@@ -47,6 +47,13 @@ func TestRaptor(t *testing.T) {
 		assert.NoError(t, Setup(t.Context(), conn))
 	})
 
+	t.Run("Setup_DropsFailedJobs", func(t *testing.T) {
+		var exists bool
+		err := conn.QueryRow(t.Context(), `SELECT EXISTS (SELECT 1 FROM pg_proc WHERE proname = 'raptor_failed_jobs')`).Scan(&exists)
+		require.NoError(t, err)
+		assert.False(t, exists)
+	})
+
 	t.Run("Enqueue", func(t *testing.T) {
 		db := beginTx(t, conn)
 

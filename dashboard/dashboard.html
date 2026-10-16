@@ -85,7 +85,7 @@ th.group { text-align: center; border-left: 1px solid var(--line); }
   <p class="asof">As of <time datetime="{{iso .Now}}">{{.Now.UTC.Format "2006-01-02 15:04:05"}} UTC</time></p>
 
   <section>
-    <h2>Throughput</h2>
+    <h2>Throughput <span class="hint">UTC days</span></h2>
     <div class="scroll"><table>
       <thead><tr><th></th><th class="n">Enqueued</th><th class="n">Completed</th><th class="n">Failed</th><th class="n">Cancelled</th><th class="n">Dead</th></tr></thead>
       <tbody>
