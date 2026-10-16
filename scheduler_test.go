@@ -23,10 +23,12 @@ func TestNewScheduler(t *testing.T) {
 			Schedule{Name: "a", Spec: "*/15 * * * *"},
 			Schedule{Name: "c", Spec: "CRON_TZ=America/Denver 0 9 * * 1-5"},
 			Schedule{Name: strings.Repeat("é", 128), Spec: "@hourly"},
+			Schedule{Name: "d", Spec: "@every 1s"},
+			Schedule{Name: "e", Spec: "TZ=UTC @every 90s"},
 		)
 		require.NoError(t, err)
-		assert.Equal(t, []string{"a", "b", "c", strings.Repeat("é", 128)}, s.names)
-		assert.Equal(t, []string{"*/15 * * * *", "@every 5m", "CRON_TZ=America/Denver 0 9 * * 1-5", "@hourly"}, s.specs)
+		assert.Equal(t, []string{"a", "b", "c", "d", "e", strings.Repeat("é", 128)}, s.names)
+		assert.Equal(t, []string{"*/15 * * * *", "@every 5m", "CRON_TZ=America/Denver 0 9 * * 1-5", "@every 1s", "TZ=UTC @every 90s", "@hourly"}, s.specs)
 	})
 
 	for name, schedules := range map[string][]Schedule{
@@ -37,6 +39,11 @@ func TestNewScheduler(t *testing.T) {
 		"zone without schedule": {{Name: "a", Spec: "CRON_TZ=UTC"}},
 		"spec too long":         {{Name: "a", Spec: "0 " + strings.Repeat("0,", 64) + "1 * * *"}},
 		"never fires":           {{Name: "a", Spec: "0 0 31 2 *"}},
+		"zero interval":         {{Name: "a", Spec: "@every 0s"}},
+		"negative interval":     {{Name: "a", Spec: "@every -5m"}},
+		"sub-second interval":   {{Name: "a", Spec: "@every 500ms"}},
+		"fractional interval":   {{Name: "a", Spec: "@every 1500ms"}},
+		"zoned zero interval":   {{Name: "a", Spec: "CRON_TZ=UTC @every 0s"}},
 		"queue too long":        {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: strings.Repeat("q", 65)}}},
 		"type too long":         {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Type: strings.Repeat("t", 65)}}},
 		"key too long":          {{Name: "a", Spec: "@hourly", Job: EnqueueJob{IdempotencyKey: strings.Repeat("k", 129)}}},

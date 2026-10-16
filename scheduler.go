@@ -6,6 +6,7 @@ import (
 	"errors"
 	"fmt"
 	"slices"
+	"strings"
 	"time"
 	"unicode/utf8"
 
@@ -28,8 +29,8 @@ type Schedule struct {
 	Name string
 
 	// Spec is a five-field cron expression ("*/15 * * * *"), a descriptor
-	// ("@hourly", "@daily", ...) or a fixed interval ("@every 5m"), at most
-	// 128 characters. It is evaluated in UTC unless prefixed with a zone, as
+	// ("@hourly", "@daily", ...) or a fixed interval of whole seconds
+	// ("@every 5m"), at most 128 characters. It is evaluated in UTC unless prefixed with a zone, as
 	// in "CRON_TZ=America/Denver 0 9 * * 1-5". Changing it makes a new
 	// schedule that first fires at its next tick.
 	Spec string
@@ -79,8 +80,9 @@ type parsedSchedule struct {
 const syncLockID int64 = 0x7261_7074_6f72_7363
 
 // NewScheduler returns a Scheduler for schedules. It returns an error if a
-// name is empty, too long or repeated, if a spec is too long, doesn't parse
-// or never fires, or if a Job can't be enqueued.
+// name is empty, too long or repeated, if a spec is too long, doesn't parse,
+// never fires or has an interval that isn't a positive number of whole
+// seconds, or if a Job can't be enqueued.
 func NewScheduler(schedules ...Schedule) (*Scheduler, error) {
 	s := &Scheduler{
 		Interval:  time.Minute,
@@ -126,6 +128,9 @@ func parseSchedule(sched Schedule) (parsedSchedule, error) {
 	if c.Next(time.Now()).IsZero() {
 		return parsedSchedule{}, errors.New("spec never fires")
 	}
+	if err := validateInterval(sched.Spec); err != nil {
+		return parsedSchedule{}, err
+	}
 
 	if err := validateScheduledJob(sched.Job); err != nil {
 		return parsedSchedule{}, err
@@ -147,6 +152,27 @@ func parseSpec(spec string) (c cron.Schedule, err error) {
 	}()
 
 	return cron.ParseStandard(spec)
+}
+
+// robfig/cron silently rounds "@every" durations up to 1s and truncates them to whole seconds.
+func validateInterval(spec string) error {
+	if strings.HasPrefix(spec, "TZ=") || strings.HasPrefix(spec, "CRON_TZ=") {
+		spec = strings.TrimSpace(spec[strings.Index(spec, " "):])
+	}
+
+	const every = "@every "
+	if !strings.HasPrefix(spec, every) {
+		return nil
+	}
+
+	d, err := time.ParseDuration(spec[len(every):])
+	if err != nil {
+		return err
+	}
+	if d < time.Second || d%time.Second != 0 {
+		return fmt.Errorf("interval %v must be a positive number of whole seconds", d)
+	}
+	return nil
 }
 
 func validateScheduledJob(job EnqueueJob) error {
