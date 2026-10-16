@@ -1,3 +1,5 @@
+LOCK TABLE "raptor_dead_jobs" IN ACCESS EXCLUSIVE MODE;
+
 DELETE FROM "raptor_dead_jobs"
 WHERE ctid IN (
   SELECT ctid FROM (
