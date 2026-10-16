@@ -325,6 +325,30 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 		assert.Equal(t, jobState{Status: "completed", Attempts: 1}, readJobState(t, db, ids[0]))
 	})
 
+	t.Run("ShutdownTimeoutFailsJobErroringBeforeTimeout", func(t *testing.T) {
+		ids := enqueueN(t, db, "run-shutdown-error", 1)
+
+		worker := newBlockingWorker()
+		worker.err = errors.New("boom")
+		r := NewConcurrentWeightedRunner(map[string]int{"run-shutdown-error": 1}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.ShutdownTimeout = 5 * time.Second
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		worker.awaitStart(t)
+		cancel()
+		close(worker.unblock)
+		require.NoError(t, <-done)
+
+		assert.Equal(t, jobState{Status: "pending", Attempts: 1}, readJobState(t, db, ids[0]))
+	})
+
 	t.Run("NegativeShutdownTimeout", func(t *testing.T) {
 		const queue = "run-shutdown-negative"
 		enqueueN(t, db, queue, 1)

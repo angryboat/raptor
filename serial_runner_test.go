@@ -217,6 +217,22 @@ func TestSerialRunner(t *testing.T) {
 		assert.Equal(t, jobState{Status: "pending", Attempts: 0}, readJobState(t, db, ids[0]))
 	})
 
+	t.Run("ExecuteJob_ClaimDeadlineFailsJob", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		ids := enqueueN(t, db, "default", 1)
+		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, 0)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+
+		job := jobs[0]
+		expired := job.ClaimedAt.Add(-time.Hour)
+		job.ClaimedAt = &expired
+
+		require.NoError(t, executeJob(t.Context(), db, newBlockingWorker(), job))
+		assert.Equal(t, jobState{Status: "pending", Attempts: 1}, readJobState(t, db, ids[0]))
+	})
+
 	t.Run("Execute_NegativeShutdownTimeout", func(t *testing.T) {
 		db := beginTx(t, conn)
 

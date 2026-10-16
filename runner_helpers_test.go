@@ -113,10 +113,12 @@ func deadFailure(t testing.TB, db DB, id string) string {
 const missingWorkerFailure = `raptor: no worker registered for job type "missing.type"`
 
 // blockingWorker reports each job it starts on started, then holds it until
-// unblock is closed or its context ends, and returns its context's error.
+// unblock is closed, returning err, or its context ends, returning the
+// context's error.
 type blockingWorker struct {
 	started chan *Job
 	unblock chan struct{}
+	err     error
 }
 
 func newBlockingWorker() *blockingWorker {
@@ -131,10 +133,10 @@ func (w *blockingWorker) Execute(ctx context.Context, job *Job) error {
 
 	select {
 	case <-w.unblock:
+		return w.err
 	case <-ctx.Done():
+		return ctx.Err()
 	}
-
-	return ctx.Err()
 }
 
 func (w *blockingWorker) awaitStart(t testing.TB) *Job {
