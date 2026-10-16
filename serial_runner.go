@@ -4,7 +4,6 @@ import (
 	"context"
 	"crypto/rand"
 	"encoding/hex"
-	"fmt"
 	"log/slog"
 )
 
@@ -54,13 +53,7 @@ func (r *SerialRunner) drainQueue(ctx context.Context, db DB, queue string) erro
 }
 
 func (r *SerialRunner) runJob(ctx context.Context, db DB, job *Job) {
-	worker, ok := r.Workers[job.Type]
-	if !ok {
-		_ = Fail(ctx, db, job, fmt.Errorf("raptor: no worker registered for job type %q", job.Type))
-		return
-	}
-
-	if err := executeJob(ctx, db, worker, job); err != nil {
+	if err := executeJob(ctx, db, r.Workers[job.Type], job); err != nil {
 		slog.ErrorContext(ctx, "failed to execute job", slog.String("job-id", job.ID), slog.String("job-type", job.Type), slog.String("queue", job.Queue), slog.String("runner-id", r.id), slog.Any("error", err))
 	}
 }

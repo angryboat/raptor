@@ -60,8 +60,8 @@ then returns, which is handy for tests and scripts.
 
 ## Jobs
 
-- **Retries**: a worker that returns an error or panics fails the job. It
-  retries until it has used `MaxAttempts` (10 by default), then moves to
+- **Retries**: a worker that returns an error or panics fails the job, as does
+  a job whose type has no registered worker. It retries until it has used `MaxAttempts` (10 by default), then moves to
   `raptor_dead_jobs`. Each retry backs off exponentially with jitter, starting
   around a second and capped at an hour, so the default 10 attempts span about
   4 to 9 minutes. An error that implements `RetryAfterError`, even wrapped,

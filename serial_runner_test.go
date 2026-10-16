@@ -54,7 +54,25 @@ func TestSerialRunner(t *testing.T) {
 		err = r.Execute(t.Context(), db)
 		require.NoError(t, err)
 
-		assert.True(t, isDead(t, db, id))
+		assert.Equal(t, missingWorkerFailure, deadFailure(t, db, id))
+	})
+
+	t.Run("Execute_NilWorkerRegistered", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:       "default",
+			Type:        "missing.type",
+			MaxAttempts: 1,
+		})
+		require.NoError(t, err)
+
+		r := NewSerialRunner([]string{"default"}, map[string]Worker{"missing.type": nil})
+
+		err = r.Execute(t.Context(), db)
+		require.NoError(t, err)
+
+		assert.Equal(t, missingWorkerFailure, deadFailure(t, db, id))
 	})
 
 	t.Run("Execute_WorkerError", func(t *testing.T) {

@@ -251,7 +251,7 @@ func runWorker(ctx context.Context, worker Worker, job *Job) (err error) {
 	}()
 
 	if worker == nil {
-		return fmt.Errorf("no worker for job type %q", job.Type)
+		return fmt.Errorf("raptor: no worker registered for job type %q", job.Type)
 	}
 
 	ctx, cancel := context.WithDeadline(context.WithoutCancel(ctx), job.ClaimDeadline())

@@ -178,6 +178,7 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 
 		cancel()
 		require.NoError(t, <-done)
+		assert.Equal(t, missingWorkerFailure, deadFailure(t, db, id))
 	})
 
 	t.Run("QueueFrozenAtRun", func(t *testing.T) {

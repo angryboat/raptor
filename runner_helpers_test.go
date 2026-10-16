@@ -96,6 +96,22 @@ func isDead(t *testing.T, db DB, id string) bool {
 	return rows.Next()
 }
 
+func deadFailure(t testing.TB, db DB, id string) string {
+	t.Helper()
+
+	rows, err := db.Query(t.Context(), `SELECT "failure_info"->>'error' FROM "raptor_dead_jobs" WHERE "id" = $1`, id)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	require.True(t, rows.Next(), "dead job %s not found", id)
+	var failure string
+	require.NoError(t, rows.Scan(&failure))
+
+	return failure
+}
+
+const missingWorkerFailure = `raptor: no worker registered for job type "missing.type"`
+
 // blockingWorker reports each job it starts on started, then holds it until
 // unblock is closed. It returns its context's error, so a job whose context
 // was cancelled mid-execution is recorded as failed.
