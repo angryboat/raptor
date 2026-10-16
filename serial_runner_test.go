@@ -35,7 +35,7 @@ func TestSerialRunner(t *testing.T) {
 
 		for _, job := range worker.jobs() {
 			err := Complete(t.Context(), db, job)
-			assert.ErrorIs(t, err, ErrJobNotFound, "job %s should already be completed by the runner", job.ID)
+			assert.ErrorIs(t, err, ErrClaimLost, "job %s should already be completed by the runner", job.ID)
 		}
 	})
 

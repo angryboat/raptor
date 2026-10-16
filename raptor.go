@@ -180,8 +180,13 @@ func Claim(ctx context.Context, db DB, queue, worker string, limit int, timeout 
 }
 
 var (
+	// ErrJobNotFound means raptor has no record of the job: it never existed
+	// or Cleanup has deleted it.
 	ErrJobNotFound = errors.New("raptor: job not found")
-	ErrClaimLost   = errors.New("raptor: job claim lost")
+	// ErrClaimLost means the job still exists but the caller's claim on it
+	// doesn't: it was reaped, reclaimed, cancelled, already settled or moved
+	// to the dead jobs.
+	ErrClaimLost = errors.New("raptor: job claim lost")
 
 	errEnqueueMissed = errors.New("raptor: enqueue neither inserted a job nor found one holding its idempotency key")
 )
@@ -210,7 +215,7 @@ func ttlSeconds(d time.Duration) int32 {
 }
 
 // Complete marks a claimed job as completed. It returns ErrClaimLost if the
-// job was reaped or reclaimed since job was claimed.
+// job was reaped, reclaimed, cancelled or settled since job was claimed.
 func Complete(ctx context.Context, db DB, job *Job) error {
 	return settleClaim(ctx, db, `SELECT "raptor_complete_job"($1, $2, $3)`, job.ID, job.ClaimedBy, job.Attempts)
 }
@@ -276,7 +281,8 @@ const (
 // marked by Permanent. The retry waits for failure's RetryAfterError delay if
 // it has a positive one, and otherwise backs off exponentially with jitter
 // from one second after the first attempt up to an hour. It returns
-// ErrClaimLost if the job was reaped or reclaimed since job was claimed.
+// ErrClaimLost if the job was reaped, reclaimed, cancelled or settled since
+// job was claimed.
 func Fail(ctx context.Context, db DB, job *Job, failure error) error {
 	return FailAfter(ctx, db, job, failure, retryDelay(job.Attempts, failure))
 }
@@ -320,7 +326,7 @@ func randDuration(limit time.Duration) time.Duration {
 
 // Release returns a claimed job that never started back to pending without
 // counting the claim as an attempt. It returns ErrClaimLost if the job was
-// reaped or reclaimed since job was claimed.
+// reaped, reclaimed, cancelled or settled since job was claimed.
 func Release(ctx context.Context, db DB, job *Job) error {
 	return settleClaim(ctx, db, `SELECT "raptor_release_job"($1, $2, $3)`, job.ID, job.ClaimedBy, job.Attempts)
 }

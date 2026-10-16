@@ -231,7 +231,7 @@ func (c *ConcurrentWeightedRunner) release(ctx context.Context, db DB, jobs ...*
 	defer cancel()
 
 	for _, job := range jobs {
-		if err := Release(ctx, db, job); err != nil {
+		if err := ignoreClaimLost(ctx, job, Release(ctx, db, job)); err != nil {
 			slog.ErrorContext(ctx, "failed to release job", slog.String("job-id", job.ID), slog.String("job-type", job.Type), slog.String("queue", job.Queue), slog.String("runner-id", c.id), slog.Any("error", err))
 		}
 	}
@@ -285,13 +285,22 @@ func executeJob(ctx context.Context, db DB, worker Worker, job *Job) error {
 
 	switch {
 	case err == nil:
-		return Complete(ctx, db, job)
+		err = Complete(ctx, db, job)
 	case interrupted:
 		// The error most likely came from shutdown cancelling ctx, so it shouldn't cost an attempt.
-		return Release(ctx, db, job)
+		err = Release(ctx, db, job)
 	default:
-		return Fail(ctx, db, job, err)
+		err = Fail(ctx, db, job, err)
 	}
+	return ignoreClaimLost(ctx, job, err)
+}
+
+func ignoreClaimLost(ctx context.Context, job *Job, err error) error {
+	if errors.Is(err, ErrClaimLost) {
+		slog.InfoContext(ctx, "job claim lost before it settled", slog.String("job-id", job.ID), slog.String("job-type", job.Type), slog.String("queue", job.Queue))
+		return nil
+	}
+	return err
 }
 
 func runWorker(ctx context.Context, worker Worker, job *Job) (err error) {

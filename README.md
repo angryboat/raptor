@@ -92,6 +92,12 @@ the runner to settle jobs after the timeout.
 - **Claims**: a worker's context has a deadline at the end of its claim (5
   minutes by default). After that, `Sweep` may give the job to another worker.
   The original worker's `Complete` or `Fail` then returns `ErrClaimLost`.
+  `Complete`, `Fail` and `Release` return `ErrClaimLost` whenever the job
+  still exists but the caller's claim no longer holds: it was reaped,
+  reclaimed, cancelled, already settled or moved to `raptor_dead_jobs`. They
+  return `ErrJobNotFound` only when raptor has no record of the job, because
+  it never existed or `Cleanup` deleted it. Runners log a lost claim at info
+  level and move on, so cancelling a running job doesn't surface as an error.
   Claim TTLs are whole seconds, so `Claim` rounds its timeout up: 500ms claims
   for one second and 1.5s for two.
 
