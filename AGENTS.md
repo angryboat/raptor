@@ -22,6 +22,9 @@ API; this file covers how to change it safely.
   jobs.
 - `scheduler.go`: recurring jobs.
 - `queue_stats.go`: per-type counters.
+- `dashboard`: read-only `http.Handler` rendering the embedded
+  `dashboard.html`. It reads the tables directly, so a migration that changes
+  them must update `dashboard/snapshot.go` too.
 - `internal/migrate`: embedded SQL migrations. `Setup` applies them under an
   advisory lock.
 - `internal/test`: per-test database helpers.

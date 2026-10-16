@@ -1,0 +1,270 @@
+{{define "n"}}<td class="n{{if not .}} zero{{end}}">{{num .}}</td>{{end -}}
+{{define "warn"}}<td class="n{{if .}} warn{{else}} zero{{end}}">{{num .}}</td>{{end -}}
+{{define "bad"}}<td class="n{{if .}} bad{{else}} zero{{end}}">{{num .}}</td>{{end -}}
+{{define "time"}}<time datetime="{{.ISO}}" title="{{.ISO}}">{{.Relative}}</time>{{end -}}
+{{define "avg"}}<td class="n{{if not .}} zero{{end}}">{{if .}}{{duration .}}{{else}}–{{end}}</td>{{end -}}
+{{define "capped"}}{{if .}}<span class="hint">latest {{.}}</span>{{end}}{{end -}}
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="robots" content="noindex">
+<title>Raptor</title>
+<style>
+:root {
+  color-scheme: light dark;
+  --bg: #f6f6f7;
+  --panel: #ffffff;
+  --fg: #1c1c1f;
+  --muted: #6b6b73;
+  --line: #e4e4e8;
+  --head: #fafafb;
+  --ok: #15803d;
+  --warn: #b45309;
+  --bad: #b91c1c;
+  --mono: ui-monospace, SFMono-Regular, Menlo, Consolas, monospace;
+}
+@media (prefers-color-scheme: dark) {
+  :root {
+    --bg: #101012;
+    --panel: #18181b;
+    --fg: #ececef;
+    --muted: #9a9aa3;
+    --line: #2a2a30;
+    --head: #1d1d21;
+    --ok: #4ade80;
+    --warn: #fbbf24;
+    --bad: #f87171;
+  }
+}
+* { box-sizing: border-box; }
+body { margin: 0; background: var(--bg); color: var(--fg); font: 14px/1.45 system-ui, -apple-system, "Segoe UI", Roboto, sans-serif; }
+header { position: sticky; top: 0; z-index: 1; display: flex; align-items: center; justify-content: space-between; gap: 1rem; padding: .75rem max(1rem, calc((100vw - 1200px) / 2)); background: var(--panel); border-bottom: 1px solid var(--line); }
+h1 { margin: 0; font-size: 1rem; font-weight: 650; letter-spacing: -.01em; }
+main { max-width: 1200px; margin: 0 auto; padding: 1.25rem 1rem 3rem; display: grid; grid-template-columns: minmax(0, 1fr); gap: 1.25rem; }
+.asof { margin: 0; color: var(--muted); font-size: .8rem; }
+section { background: var(--panel); border: 1px solid var(--line); border-radius: 8px; overflow: hidden; }
+h2 { display: flex; align-items: baseline; gap: .6rem; margin: 0; padding: .7rem 1rem; font-size: .8rem; font-weight: 600; text-transform: uppercase; letter-spacing: .05em; color: var(--muted); border-bottom: 1px solid var(--line); }
+.hint { font-weight: 400; text-transform: none; letter-spacing: 0; }
+.scroll { overflow-x: auto; }
+table { width: 100%; border-collapse: collapse; }
+th, td { padding: .45rem 1rem; text-align: left; white-space: nowrap; border-bottom: 1px solid var(--line); }
+tbody tr:last-child > * { border-bottom: 0; }
+thead th { background: var(--head); color: var(--muted); font-size: .75rem; font-weight: 500; }
+tbody th { font-weight: 500; }
+th.group { text-align: center; border-left: 1px solid var(--line); }
+.split { border-left: 1px solid var(--line); }
+.n { text-align: right; font-variant-numeric: tabular-nums; }
+.zero { color: var(--muted); opacity: .55; }
+.warn { color: var(--warn); font-weight: 600; }
+.bad { color: var(--bad); font-weight: 600; }
+.mono { font-family: var(--mono); font-size: .78rem; }
+.muted { color: var(--muted); }
+.err { max-width: 32rem; overflow: hidden; text-overflow: ellipsis; color: var(--bad); }
+.tag { display: inline-block; margin-left: .4rem; padding: 0 .4rem; border-radius: 4px; font-size: .7rem; font-weight: 600; text-transform: uppercase; letter-spacing: .03em; }
+.tag.warn { background: color-mix(in srgb, var(--warn) 14%, transparent); }
+.tag.bad { background: color-mix(in srgb, var(--bad) 14%, transparent); }
+.empty { margin: 0; padding: 1rem; color: var(--muted); }
+.live { display: inline-flex; align-items: center; gap: .5rem; padding: .3rem .7rem; border: 1px solid var(--line); border-radius: 999px; font-size: .8rem; cursor: pointer; user-select: none; }
+.live input { position: absolute; opacity: 0; pointer-events: none; }
+.live:has(input:focus-visible) { outline: 2px solid var(--ok); outline-offset: 2px; }
+.dot { width: .5rem; height: .5rem; border-radius: 50%; background: var(--muted); opacity: .6; }
+.live.on .dot { background: var(--ok); opacity: 1; animation: pulse 2s ease-in-out infinite; }
+.live.failed .dot { background: var(--bad); animation: none; }
+@keyframes pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .live.on .dot { animation: none; } }
+</style>
+</head>
+<body>
+<header>
+  <h1>Raptor</h1>
+  <label class="live" title="Refresh every 5 seconds"><input type="checkbox" id="live"><span class="dot"></span>Live</label>
+</header>
+<main id="content">
+  <p class="asof">As of <time datetime="{{iso .Now}}">{{.Now.UTC.Format "2006-01-02 15:04:05"}} UTC</time></p>
+
+  <section>
+    <h2>Throughput</h2>
+    <div class="scroll"><table>
+      <thead><tr><th></th><th class="n">Enqueued</th><th class="n">Completed</th><th class="n">Failed</th><th class="n">Cancelled</th><th class="n">Dead</th></tr></thead>
+      <tbody>
+      {{- range .Totals}}
+        <tr><th scope="row">{{.Label}}</th>{{template "n" .Enqueued}}{{template "n" .Completed}}{{template "warn" .Failed}}{{template "n" .Cancelled}}{{template "bad" .Dead}}</tr>
+      {{- end}}
+      </tbody>
+    </table></div>
+  </section>
+
+  <section>
+    <h2>Queues</h2>
+    {{- if .Queues}}
+    <div class="scroll"><table>
+      <thead>
+        <tr><th></th><th class="group" colspan="4">Now</th><th class="group" colspan="5">All time</th></tr>
+        <tr><th>Queue</th><th class="n split">Ready</th><th class="n">Delayed</th><th class="n">Running</th><th class="n">Retrying</th><th class="n split">Completed</th><th class="n">Failed</th><th class="n">Cancelled</th><th class="n">Dead</th><th class="n">Avg time</th></tr>
+      </thead>
+      <tbody>
+      {{- range .Queues}}
+        <tr><th scope="row">{{.Name}}</th><td class="n split{{if not .Ready}} zero{{end}}">{{num .Ready}}</td>{{template "n" .Delayed}}{{template "n" .Running}}{{template "warn" .Retrying}}<td class="n split{{if not .Completed}} zero{{end}}">{{num .Completed}}</td>{{template "warn" .Failed}}{{template "n" .Cancelled}}{{template "bad" .Dead}}{{template "avg" .AvgDuration}}</tr>
+      {{- end}}
+      </tbody>
+    </table></div>
+    {{- else}}
+    <p class="empty">No queues yet. A queue appears once a job is enqueued to it.</p>
+    {{- end}}
+  </section>
+
+  <section>
+    <h2>Schedules</h2>
+    {{- if .Schedules}}
+    <div class="scroll"><table>
+      <thead><tr><th>Name</th><th>Spec</th><th>Next run</th><th>Last run</th></tr></thead>
+      <tbody>
+      {{- range .Schedules}}
+        <tr>
+          <th scope="row">{{.Name}}</th>
+          <td class="mono">{{.Spec}}</td>
+          <td>{{template "time" (at $.Now .NextRunAt)}}{{if .Abandoned}}<span class="tag bad" title="Over an hour overdue: no running scheduler defines it">abandoned</span>{{else if .Due}}<span class="tag warn">due</span>{{end}}</td>
+          <td>{{with .LastRunAt}}{{template "time" (at $.Now .)}}{{else}}<span class="muted">never</span>{{end}}</td>
+        </tr>
+      {{- end}}
+      </tbody>
+    </table></div>
+    {{- else}}
+    <p class="empty">No schedules. A schedule appears once a Scheduler syncs it.</p>
+    {{- end}}
+  </section>
+
+  <section>
+    <h2>Running {{template "capped" (and (eq (len .Running) $.Limit) $.Limit)}}</h2>
+    {{- if .Running}}
+    <div class="scroll"><table>
+      <thead><tr><th>Job</th><th>Queue</th><th>Type</th><th>Worker</th><th class="n">Attempt</th><th>Started</th><th>Claim expires</th></tr></thead>
+      <tbody>
+      {{- range .Running}}
+        <tr>
+          <td class="mono">{{.ID}}</td>
+          <td>{{.Queue}}</td>
+          <td>{{.Type}}</td>
+          <td class="mono">{{.Worker}}</td>
+          <td class="n">{{.Attempts}}/{{.MaxAttempts}}</td>
+          <td>{{template "time" (at $.Now .ClaimedAt)}}</td>
+          <td>{{template "time" (at $.Now .Deadline)}}{{if .Expired}}<span class="tag bad" title="Sweep will retry it">expired</span>{{end}}</td>
+        </tr>
+      {{- end}}
+      </tbody>
+    </table></div>
+    {{- else}}
+    <p class="empty">No jobs running.</p>
+    {{- end}}
+  </section>
+
+  <section>
+    <h2>Retrying {{template "capped" (and (eq (len .Retrying) $.Limit) $.Limit)}}</h2>
+    {{- if .Retrying}}
+    <div class="scroll"><table>
+      <thead><tr><th>Job</th><th>Queue</th><th>Type</th><th class="n">Attempt</th><th>Error</th><th>Failed</th><th>Next attempt</th></tr></thead>
+      <tbody>
+      {{- range .Retrying}}
+        <tr>
+          <td class="mono">{{.ID}}</td>
+          <td>{{.Queue}}</td>
+          <td>{{.Type}}</td>
+          <td class="n">{{.Attempts}}/{{.MaxAttempts}}</td>
+          <td class="err" title="{{.Error}}">{{.Error}}</td>
+          <td>{{template "time" (at $.Now .FailedAt)}}</td>
+          <td>{{template "time" (at $.Now .RetryAt)}}</td>
+        </tr>
+      {{- end}}
+      </tbody>
+    </table></div>
+    {{- else}}
+    <p class="empty">No failed jobs waiting to retry.</p>
+    {{- end}}
+  </section>
+
+  <section>
+    <h2>Dead {{template "capped" (and (eq (len .Dead) $.Limit) $.Limit)}}</h2>
+    {{- if .Dead}}
+    <div class="scroll"><table>
+      <thead><tr><th>Job</th><th>Queue</th><th>Type</th><th class="n">Attempts</th><th>Error</th><th>Died</th></tr></thead>
+      <tbody>
+      {{- range .Dead}}
+        <tr>
+          <td class="mono">{{.ID}}</td>
+          <td>{{.Queue}}</td>
+          <td>{{.Type}}</td>
+          <td class="n">{{.Attempts}}</td>
+          <td class="err" title="{{.Error}}">{{.Error}}</td>
+          <td>{{template "time" (at $.Now .DiedAt)}}</td>
+        </tr>
+      {{- end}}
+      </tbody>
+    </table></div>
+    {{- else}}
+    <p class="empty">No dead jobs.</p>
+    {{- end}}
+  </section>
+
+  <section>
+    <h2>Job types</h2>
+    {{- if .JobTypes}}
+    <div class="scroll"><table>
+      <thead><tr><th>Queue</th><th>Type</th><th class="n">Completed</th><th class="n">Failed</th><th class="n">Cancelled</th><th class="n">Dead</th><th class="n">Avg time</th></tr></thead>
+      <tbody>
+      {{- range .JobTypes}}
+        <tr><td>{{.Queue}}</td><th scope="row">{{.Type}}</th>{{template "n" .Completed}}{{template "warn" .Failed}}{{template "n" .Cancelled}}{{template "bad" .Dead}}{{template "avg" .AvgDuration}}</tr>
+      {{- end}}
+      </tbody>
+    </table></div>
+    {{- else}}
+    <p class="empty">No job types yet.</p>
+    {{- end}}
+  </section>
+</main>
+<script>
+(function () {
+  var key = "raptor-dashboard-live";
+  var input = document.getElementById("live");
+  var label = input.closest("label");
+  var timer;
+
+  try { input.checked = localStorage.getItem(key) === "1"; } catch (e) {}
+
+  async function refresh() {
+    try {
+      var res = await fetch(location.href, { cache: "no-store", headers: { Accept: "text/html" } });
+      var next = res.ok && new DOMParser().parseFromString(await res.text(), "text/html").getElementById("content");
+      if (!next) throw new Error("unexpected response");
+      document.getElementById("content").replaceWith(next);
+      label.classList.remove("failed");
+      label.title = "Refresh every 5 seconds";
+    } catch (e) {
+      label.classList.add("failed");
+      label.title = "Last refresh failed; retrying";
+    }
+  }
+
+  function schedule() {
+    clearTimeout(timer);
+    label.classList.toggle("on", input.checked);
+    if (input.checked && !document.hidden) {
+      timer = setTimeout(async function () { await refresh(); schedule(); }, 5000);
+    }
+  }
+
+  input.addEventListener("change", function () {
+    try { localStorage.setItem(key, input.checked ? "1" : "0"); } catch (e) {}
+    if (input.checked) refresh();
+    schedule();
+  });
+  document.addEventListener("visibilitychange", function () {
+    if (input.checked && !document.hidden) refresh();
+    schedule();
+  });
+  schedule();
+})();
+</script>
+</body>
+</html>
