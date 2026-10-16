@@ -224,7 +224,11 @@ func (j *Job) ClaimDeadline() time.Time {
 }
 
 func ttlSeconds(d time.Duration) int32 {
-	return int32(min(math.Ceil(d.Seconds()), math.MaxInt32))
+	secs := d / time.Second
+	if d%time.Second > 0 {
+		secs++
+	}
+	return int32(min(secs, math.MaxInt32))
 }
 
 // Complete marks a claimed job as completed. It returns ErrClaimLost if the

@@ -587,7 +587,8 @@ func TestTTLSeconds(t *testing.T) {
 		time.Second + time.Nanosecond: 2,
 		time.Minute:                   60,
 		math.MaxInt32 * time.Second:   math.MaxInt32,
-		time.Duration(math.MaxInt64):  math.MaxInt32,
+		(math.MaxInt32-1)*time.Second + time.Nanosecond: math.MaxInt32,
+		time.Duration(math.MaxInt64):                    math.MaxInt32,
 	} {
 		assert.Equal(t, want, ttlSeconds(d), "duration %s", d)
 	}
