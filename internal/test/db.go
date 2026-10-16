@@ -2,7 +2,7 @@ package test
 
 import (
 	"context"
-	"crypto/md5"
+	"crypto/sha256"
 	"encoding/hex"
 	"runtime"
 	"testing"
@@ -67,13 +67,13 @@ func dbNameFor(t testing.TB) string {
 
 	_, f, _, _ := runtime.Caller(0)
 
-	sum := md5.New()
+	sum := sha256.New()
 	_, err := sum.Write([]byte(t.Name()))
 	require.NoError(t, err)
 	_, err = sum.Write([]byte(f))
 	require.NoError(t, err)
 
-	return "raptor_test_" + hex.EncodeToString(sum.Sum(nil))
+	return "raptor_test_" + hex.EncodeToString(sum.Sum(nil)[:16])
 }
 
 func dsnFor(dbName string) string {
