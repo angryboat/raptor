@@ -584,13 +584,13 @@ func TestRaptor(t *testing.T) {
 			FOR EACH STATEMENT EXECUTE FUNCTION "raptor_test_free_job"();`)
 		require.NoError(t, err)
 
-		before := totalJobs(t, db)
+		before := globalTotals(t, db).Jobs
 
 		secondID, err := Enqueue(t.Context(), db, job)
 		require.NoError(t, err)
 		assert.NotEmpty(t, secondID)
 		assert.NotEqual(t, firstID, secondID)
-		assert.Equal(t, before+1, totalJobs(t, db))
+		assert.Equal(t, before+1, globalTotals(t, db).Jobs)
 	})
 
 	t.Run("Enqueue_KeyNeverFree", func(t *testing.T) {
@@ -698,17 +698,7 @@ func TestEnqueue_KeyFreedConcurrently(t *testing.T) {
 	require.NoError(t, got.err)
 	assert.NotEmpty(t, got.id)
 	assert.NotEqual(t, firstID, got.id)
-	assert.Equal(t, int64(2), totalJobs(t, pool))
-}
-
-func totalJobs(t testing.TB, db DB) int64 {
-	t.Helper()
-
-	rows, err := db.Query(t.Context(), `SELECT "total_jobs" FROM "raptor_stats" WHERE "span" = 'all_time'`)
-	require.NoError(t, err)
-	n, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[int64])
-	require.NoError(t, err)
-	return n
+	assert.Equal(t, int64(2), globalTotals(t, pool).Jobs)
 }
 
 func TestBackoff(t *testing.T) {
