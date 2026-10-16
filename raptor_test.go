@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/angryboat/raptor/internal/test"
+	"github.com/jackc/pgx/v5"
 	"github.com/stretchr/testify/assert"
 	"github.com/stretchr/testify/require"
 )
@@ -339,6 +340,28 @@ func TestRaptor(t *testing.T) {
 		err = Fail(t.Context(), db, claimed[0], errors.New("boom"))
 		require.NoError(t, err)
 
+		var (
+			queue, jobType, status, claimedBy, reason string
+			attempts                                  int32
+			failedAtIsNow                             bool
+		)
+		err = db.QueryRow(t.Context(), `
+			SELECT "queue_name", "job_type", "status"::text, "claimed_by", "attempts", "failed_at" = now(), "failure_info"->>'error'
+			FROM "raptor_dead_jobs" WHERE "id" = $1`, id).
+			Scan(&queue, &jobType, &status, &claimedBy, &attempts, &failedAtIsNow, &reason)
+		require.NoError(t, err)
+		assert.Equal(t, "default", queue)
+		assert.Equal(t, "test.job", jobType)
+		assert.Equal(t, "failed", status)
+		assert.Equal(t, "worker-1", claimedBy)
+		assert.Equal(t, int32(1), attempts)
+		assert.True(t, failedAtIsNow)
+		assert.Equal(t, "boom", reason)
+
+		var live bool
+		require.NoError(t, db.QueryRow(t.Context(), `SELECT EXISTS (SELECT 1 FROM "raptor_jobs" WHERE "id" = $1)`, id).Scan(&live))
+		assert.False(t, live)
+
 		jobs, err := Claim(t.Context(), db, "default", "worker-2", 1, time.Minute)
 		require.NoError(t, err)
 		assert.Empty(t, jobs)
@@ -380,6 +403,53 @@ func TestRaptor(t *testing.T) {
 		require.NoError(t, err)
 		assert.Equal(t, "failed", status)
 		assert.Equal(t, "boom", reason)
+	})
+
+	t.Run("Fail_Dead_ReusedID", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		var id string
+		err := db.QueryRow(t.Context(), `
+			INSERT INTO "raptor_dead_jobs" ("queue_name", "job_type", "status", "failed_at", "failure_info")
+			VALUES ('reused', 'test.job', 'failed', now() - INTERVAL '1 day', '{"error":"first"}')
+			RETURNING "id"`).Scan(&id)
+		require.NoError(t, err)
+
+		_, err = db.Exec(t.Context(), `INSERT INTO "raptor_jobs" ("id", "queue_name", "job_type", "max_attempts") VALUES ($1, 'reused', 'test.job', 1)`, id)
+		require.NoError(t, err)
+
+		claimed, err := Claim(t.Context(), db, "reused", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+
+		require.NoError(t, Fail(t.Context(), db, claimed[0], errors.New("second")))
+
+		rows, err := db.Query(t.Context(), `SELECT "failure_info"->>'error' FROM "raptor_dead_jobs" WHERE "id" = $1`, id)
+		require.NoError(t, err)
+		reasons, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		require.NoError(t, err)
+		assert.Equal(t, []string{"second"}, reasons)
+	})
+
+	t.Run("DeadJobs_Indexes", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		var pkey string
+		err := db.QueryRow(t.Context(), `
+			SELECT pg_get_constraintdef("oid") FROM pg_constraint
+			WHERE "conrelid" = '"raptor_dead_jobs"'::regclass AND "contype" = 'p'`).Scan(&pkey)
+		require.NoError(t, err)
+		assert.Equal(t, "PRIMARY KEY (id)", pkey)
+
+		var failedAtIndexed bool
+		err = db.QueryRow(t.Context(), `
+			SELECT EXISTS (
+				SELECT 1 FROM pg_index i
+				JOIN pg_attribute a ON a."attrelid" = i."indrelid" AND a."attnum" = i."indkey"[0]
+				WHERE i."indrelid" = '"raptor_dead_jobs"'::regclass AND a."attname" = 'failed_at'
+			)`).Scan(&failedAtIndexed)
+		require.NoError(t, err)
+		assert.True(t, failedAtIndexed)
 	})
 
 	t.Run("Release", func(t *testing.T) {
