@@ -328,6 +328,22 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 
 		assert.ErrorIs(t, r.Run(ctx, db), context.DeadlineExceeded)
 	})
+	for name, threads := range map[string]int{"ZeroThreads": 0, "NegativeThreads": -1} {
+		t.Run(name, func(t *testing.T) {
+			queue := "run-threads-" + name
+			enqueueN(t, db, queue, 1)
+
+			r := NewConcurrentWeightedRunner(map[string]int{queue: 1}, nil)
+			r.Threads = threads
+			r.emptyCooldown = 10 * time.Millisecond
+
+			ctx, cancel := context.WithTimeout(t.Context(), time.Second)
+			defer cancel()
+
+			assert.EqualError(t, r.Run(ctx, db), fmt.Sprintf("raptor: runner threads %d must be positive", threads))
+			assert.Zero(t, countClaimed(t, db, queue))
+		})
+	}
 }
 
 func TestConcurrentWeightedRunner_Run_DequeueError(t *testing.T) {

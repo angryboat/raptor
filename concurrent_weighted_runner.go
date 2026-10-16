@@ -15,6 +15,8 @@ import (
 type ConcurrentWeightedRunner struct {
 	Queue   map[string]int
 	Workers map[string]Worker
+	// Threads is how many jobs Run executes at once. It must be positive;
+	// NewConcurrentWeightedRunner sets it to runtime.NumCPU().
 	Threads int
 
 	emptyCooldown time.Duration
@@ -37,6 +39,10 @@ func (c *ConcurrentWeightedRunner) Quiet() {
 }
 
 func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
+	if c.Threads <= 0 {
+		return fmt.Errorf("raptor: runner threads %d must be positive", c.Threads)
+	}
+
 	ctx, cancel := context.WithCancelCause(parent)
 	defer cancel(nil)
 
