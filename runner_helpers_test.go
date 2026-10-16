@@ -204,3 +204,25 @@ func (r *closeHookRows) Close() {
 	r.Rows.Close()
 	r.onClose()
 }
+
+type retryAfterError struct {
+	after time.Duration
+}
+
+func (e retryAfterError) Error() string { return "rate limited" }
+
+func (e retryAfterError) RetryAfter() time.Duration { return e.after }
+
+func retryDelayOf(t testing.TB, db DB, id string) time.Duration {
+	t.Helper()
+
+	rows, err := db.Query(t.Context(), `SELECT (EXTRACT(EPOCH FROM "visible_at" - now()) * 1000)::bigint FROM "raptor_jobs" WHERE "id" = $1 AND "status" = 'pending'`, id)
+	require.NoError(t, err)
+	defer rows.Close()
+
+	require.True(t, rows.Next(), "pending job %s not found", id)
+	var ms int64
+	require.NoError(t, rows.Scan(&ms))
+
+	return time.Duration(ms) * time.Millisecond
+}

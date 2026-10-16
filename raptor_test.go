@@ -2,6 +2,8 @@ package raptor
 
 import (
 	"errors"
+	"fmt"
+	"math"
 	"sync"
 	"testing"
 	"time"
@@ -136,7 +138,7 @@ func TestRaptor(t *testing.T) {
 		require.NoError(t, err)
 		require.Len(t, jobs, 1)
 
-		err = Fail(t.Context(), db, jobs[0], errors.New("boom"))
+		err = FailAfter(t.Context(), db, jobs[0], errors.New("boom"), 0)
 		require.NoError(t, err)
 
 		jobs, err = Claim(t.Context(), db, "default", "worker-2", 1, time.Minute)
@@ -144,6 +146,141 @@ func TestRaptor(t *testing.T) {
 		require.Len(t, jobs, 1)
 		assert.Equal(t, id, jobs[0].ID)
 		assert.Equal(t, int32(2), jobs[0].Attempts)
+	})
+
+	t.Run("Fail_Backoff", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:       "default",
+			Type:        "test.job",
+			MaxAttempts: 4,
+		})
+		require.NoError(t, err)
+
+		for attempt := range int32(3) {
+			jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+			require.NoError(t, err)
+			require.Len(t, jobs, 1)
+			require.Equal(t, attempt+1, jobs[0].Attempts)
+
+			require.NoError(t, Fail(t.Context(), db, jobs[0], errors.New("boom")))
+
+			ceiling := retryBaseDelay << attempt
+			delay := retryDelayOf(t, db, id)
+			assert.GreaterOrEqual(t, delay, ceiling/2, "attempt %d", attempt+1)
+			assert.LessOrEqual(t, delay, ceiling, "attempt %d", attempt+1)
+
+			more, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+			require.NoError(t, err)
+			require.Empty(t, more, "a backed-off job shouldn't be claimable yet")
+
+			_, err = db.Exec(t.Context(), `UPDATE "raptor_jobs" SET "visible_at" = now() WHERE "id" = $1`, id)
+			require.NoError(t, err)
+		}
+	})
+
+	t.Run("Fail_RetryAfter", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:       "default",
+			Type:        "test.job",
+			MaxAttempts: 3,
+		})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+
+		failure := fmt.Errorf("fetch: %w", retryAfterError{after: 90 * time.Second})
+		require.NoError(t, Fail(t.Context(), db, jobs[0], failure))
+
+		assert.Equal(t, 90*time.Second, retryDelayOf(t, db, id))
+	})
+
+	t.Run("Fail_RetryAfterNonPositive", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:       "default",
+			Type:        "test.job",
+			MaxAttempts: 3,
+		})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+
+		require.NoError(t, Fail(t.Context(), db, jobs[0], retryAfterError{}))
+
+		delay := retryDelayOf(t, db, id)
+		assert.GreaterOrEqual(t, delay, retryBaseDelay/2)
+		assert.LessOrEqual(t, delay, retryBaseDelay)
+	})
+
+	t.Run("FailAfter", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:       "default",
+			Type:        "test.job",
+			MaxAttempts: 3,
+		})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+
+		failure := retryAfterError{after: time.Hour}
+		require.NoError(t, FailAfter(t.Context(), db, jobs[0], failure, 5*time.Second))
+
+		assert.Equal(t, 5*time.Second, retryDelayOf(t, db, id), "an explicit delay overrides RetryAfter")
+	})
+
+	t.Run("FailAfter_LongDelay", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:       "default",
+			Type:        "test.job",
+			MaxAttempts: 3,
+		})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+
+		delay := 400 * 24 * time.Hour
+		require.NoError(t, FailAfter(t.Context(), db, jobs[0], errors.New("boom"), delay))
+
+		assert.Equal(t, delay, retryDelayOf(t, db, id))
+	})
+
+	t.Run("Sweep_RetryDelay", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:       "sweep-delay",
+			Type:        "test.job",
+			MaxAttempts: 3,
+		})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "sweep-delay", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+
+		_, err = db.Exec(t.Context(), `UPDATE "raptor_jobs" SET "claimed_at" = now() - INTERVAL '1 hour' WHERE "id" = $1`, id)
+		require.NoError(t, err)
+
+		require.NoError(t, Sweep(t.Context(), db, "sweep-delay"))
+
+		assert.Equal(t, 30*time.Second, retryDelayOf(t, db, id))
 	})
 
 	t.Run("Fail_Dead", func(t *testing.T) {
@@ -385,4 +522,21 @@ func TestRaptor(t *testing.T) {
 
 		assert.Equal(t, firstID, secondID)
 	})
+}
+
+func TestBackoff(t *testing.T) {
+	for attempts, ceiling := range map[int32]time.Duration{
+		0:             time.Second,
+		1:             time.Second,
+		2:             2 * time.Second,
+		10:            512 * time.Second,
+		13:            retryMaxDelay,
+		math.MaxInt32: retryMaxDelay,
+	} {
+		for range 100 {
+			delay := backoff(attempts)
+			assert.GreaterOrEqual(t, delay, ceiling/2, "attempts %d", attempts)
+			assert.LessOrEqual(t, delay, ceiling, "attempts %d", attempts)
+		}
+	}
 }

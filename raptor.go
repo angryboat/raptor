@@ -2,8 +2,10 @@ package raptor
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"math/big"
 	"time"
 
 	"github.com/angryboat/raptor/internal/migrate"
@@ -246,10 +248,31 @@ func Cancel(ctx context.Context, db DB, jobID string) error {
 	return nil
 }
 
+// RetryAfterError is a failure that knows when its job should next run, such
+// as a rate limit response carrying Retry-After. Fail finds it with
+// errors.As, so it applies when wrapped.
+type RetryAfterError interface {
+	error
+	RetryAfter() time.Duration
+}
+
+const (
+	retryBaseDelay = time.Second
+	retryMaxDelay  = time.Hour
+)
+
 // Fail records a failed attempt of a claimed job, scheduling a retry or
-// moving it to the dead jobs once its attempts are exhausted. It returns
-// ErrClaimLost if the job was reaped or reclaimed since job was claimed.
+// moving it to the dead jobs once its attempts are exhausted. The retry waits
+// for failure's RetryAfterError delay if it has a positive one, and otherwise
+// backs off exponentially with jitter from one second after the first attempt
+// up to an hour. It returns ErrClaimLost if the job was reaped or reclaimed
+// since job was claimed.
 func Fail(ctx context.Context, db DB, job *Job, failure error) error {
+	return FailAfter(ctx, db, job, failure, retryDelay(job.Attempts, failure))
+}
+
+// FailAfter is Fail with an explicit delay before the retry.
+func FailAfter(ctx context.Context, db DB, job *Job, failure error, delay time.Duration) error {
 	var info any
 	if failure != nil {
 		info = map[string]string{"error": failure.Error()}
@@ -259,7 +282,27 @@ func Fail(ctx context.Context, db DB, job *Job, failure error) error {
 		return err
 	}
 
-	return settleClaim(ctx, db, `SELECT "raptor_fail_job"($1, $2, $3, $4)`, job.ID, job.ClaimedBy, job.Attempts, infoJSON)
+	return settleClaim(ctx, db, `SELECT "raptor_fail_job"($1, $2, $3, $4, $5)`, job.ID, job.ClaimedBy, job.Attempts, infoJSON, delay)
+}
+
+func retryDelay(attempts int32, failure error) time.Duration {
+	if ra, ok := errors.AsType[RetryAfterError](failure); ok && ra.RetryAfter() > 0 {
+		return ra.RetryAfter()
+	}
+	return backoff(attempts)
+}
+
+func backoff(attempts int32) time.Duration {
+	ceiling := min(retryBaseDelay<<min(max(attempts-1, 0), 30), retryMaxDelay)
+	return ceiling/2 + randDuration(ceiling/2)
+}
+
+func randDuration(limit time.Duration) time.Duration {
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(limit)+1))
+	if err != nil {
+		return limit
+	}
+	return time.Duration(n.Int64())
 }
 
 // Release returns a claimed job that never started back to pending without
