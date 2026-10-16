@@ -431,6 +431,88 @@ func TestRaptor(t *testing.T) {
 		assert.Equal(t, []string{"second"}, reasons)
 	})
 
+	t.Run("Fail_Permanent", func(t *testing.T) {
+		for name, tc := range map[string]struct {
+			failure error
+			reason  string
+			dead    bool
+		}{
+			"Marked":    {failure: Permanent(errors.New("bad payload")), reason: "bad payload", dead: true},
+			"Wrapped":   {failure: fmt.Errorf("handle: %w", Permanent(errors.New("bad payload"))), reason: "handle: bad payload", dead: true},
+			"NotMarked": {failure: errors.New("flaky"), reason: "flaky", dead: false},
+		} {
+			t.Run(name, func(t *testing.T) {
+				db := beginTx(t, conn)
+
+				id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "permanent", Type: "test.job", MaxAttempts: 10})
+				require.NoError(t, err)
+
+				claimed, err := Claim(t.Context(), db, "permanent", "worker-1", 1, time.Minute)
+				require.NoError(t, err)
+				require.Len(t, claimed, 1)
+				require.Equal(t, int32(1), claimed[0].Attempts)
+
+				require.NoError(t, Fail(t.Context(), db, claimed[0], tc.failure))
+
+				assert.Equal(t, tc.dead, isDead(t, db, id))
+
+				table := `"raptor_jobs"`
+				if tc.dead {
+					table = `"raptor_dead_jobs"`
+				}
+				var reason string
+				var attempts int32
+				err = db.QueryRow(t.Context(), `SELECT "failure_info"->>'error', "attempts" FROM `+table+` WHERE "id" = $1`, id).Scan(&reason, &attempts)
+				require.NoError(t, err)
+				assert.Equal(t, tc.reason, reason)
+				assert.Equal(t, int32(1), attempts)
+
+				stat, err := LoadQueueStat(t.Context(), db, "permanent")
+				require.NoError(t, err)
+				js := stat.Jobs["test.job"]
+				if tc.dead {
+					assert.Equal(t, uint64(1), js.DeadCount)
+					assert.Zero(t, js.FailedCount)
+				} else {
+					assert.Zero(t, js.DeadCount)
+					assert.Equal(t, uint64(1), js.FailedCount)
+				}
+			})
+		}
+	})
+
+	t.Run("FailAfter_Permanent", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "permanent", Type: "test.job", MaxAttempts: 10})
+		require.NoError(t, err)
+
+		claimed, err := Claim(t.Context(), db, "permanent", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+
+		require.NoError(t, FailAfter(t.Context(), db, claimed[0], Permanent(errors.New("bad payload")), time.Minute))
+
+		assert.True(t, isDead(t, db, id))
+	})
+
+	t.Run("Fail_Permanent_ClaimLost", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "permanent", Type: "test.job", MaxAttempts: 10})
+		require.NoError(t, err)
+
+		claimed, err := Claim(t.Context(), db, "permanent", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, claimed, 1)
+
+		stale := *claimed[0]
+		stale.ClaimedBy = new("worker-2")
+
+		assert.ErrorIs(t, Fail(t.Context(), db, &stale, Permanent(errors.New("bad payload"))), ErrClaimLost)
+		assert.False(t, isDead(t, db, id))
+	})
+
 	t.Run("DeadJobs_Indexes", func(t *testing.T) {
 		db := beginTx(t, conn)
 
@@ -709,6 +791,15 @@ func TestRaptor(t *testing.T) {
 
 		assert.Equal(t, firstID, secondID)
 	})
+}
+
+func TestPermanent(t *testing.T) {
+	assert.NoError(t, Permanent(nil))
+
+	cause := errors.New("bad payload")
+	err := Permanent(cause)
+	assert.EqualError(t, err, "bad payload")
+	assert.ErrorIs(t, err, cause)
 }
 
 func TestBackoff(t *testing.T) {
