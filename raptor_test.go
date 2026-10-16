@@ -241,6 +241,48 @@ func TestRaptor(t *testing.T) {
 		assert.Equal(t, 5*time.Second, retryDelayOf(t, db, id), "an explicit delay overrides RetryAfter")
 	})
 
+	t.Run("FailAfter_LongDelay", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:       "default",
+			Type:        "test.job",
+			MaxAttempts: 3,
+		})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+
+		delay := 400 * 24 * time.Hour
+		require.NoError(t, FailAfter(t.Context(), db, jobs[0], errors.New("boom"), delay))
+
+		assert.Equal(t, delay, retryDelayOf(t, db, id))
+	})
+
+	t.Run("Sweep_RetryDelay", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:       "sweep-delay",
+			Type:        "test.job",
+			MaxAttempts: 3,
+		})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "sweep-delay", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+
+		_, err = db.Exec(t.Context(), `UPDATE "raptor_jobs" SET "claimed_at" = now() - INTERVAL '1 hour' WHERE "id" = $1`, id)
+		require.NoError(t, err)
+
+		require.NoError(t, Sweep(t.Context(), db, "sweep-delay"))
+
+		assert.Equal(t, 30*time.Second, retryDelayOf(t, db, id))
+	})
+
 	t.Run("Fail_Dead", func(t *testing.T) {
 		db := beginTx(t, conn)
 

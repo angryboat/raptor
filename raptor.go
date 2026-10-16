@@ -2,10 +2,10 @@ package raptor
 
 import (
 	"context"
+	"crypto/rand"
 	"encoding/json"
 	"errors"
-	"math"
-	"math/rand/v2"
+	"math/big"
 	"time"
 
 	"github.com/angryboat/raptor/internal/migrate"
@@ -282,9 +282,7 @@ func FailAfter(ctx context.Context, db DB, job *Job, failure error, delay time.D
 		return err
 	}
 
-	delayMs := int32(min(max(delay.Milliseconds(), 0), math.MaxInt32))
-
-	return settleClaim(ctx, db, `SELECT "raptor_fail_job"($1, $2, $3, $4, $5)`, job.ID, job.ClaimedBy, job.Attempts, infoJSON, delayMs)
+	return settleClaim(ctx, db, `SELECT "raptor_fail_job"($1, $2, $3, $4, $5)`, job.ID, job.ClaimedBy, job.Attempts, infoJSON, delay)
 }
 
 func retryDelay(attempts int32, failure error) time.Duration {
@@ -296,7 +294,15 @@ func retryDelay(attempts int32, failure error) time.Duration {
 
 func backoff(attempts int32) time.Duration {
 	ceiling := min(retryBaseDelay<<min(max(attempts-1, 0), 30), retryMaxDelay)
-	return ceiling/2 + rand.N(ceiling/2+1)
+	return ceiling/2 + randDuration(ceiling/2)
+}
+
+func randDuration(limit time.Duration) time.Duration {
+	n, err := rand.Int(rand.Reader, big.NewInt(int64(limit)+1))
+	if err != nil {
+		return limit
+	}
+	return time.Duration(n.Int64())
 }
 
 // Release returns a claimed job that never started back to pending without
