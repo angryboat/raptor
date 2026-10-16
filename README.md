@@ -123,8 +123,9 @@ Call these on a timer, or from a scheduled job:
 
 - `Sweep` retries jobs whose claim has expired and cancels jobs whose
   `ExpiresAt` has passed.
-- `Cleanup` deletes completed jobs after 24 hours and cancelled jobs after 2
-  hours, and rolls up stats.
+- `Cleanup` deletes completed jobs after 24 hours, cancelled jobs after 2
+  hours and dead jobs after 30 days, and rolls up stats. Per-type dead counts
+  in `LoadQueueStat` are kept.
 
 `LoadQueueStat` reports completed, failed, cancelled and dead counts for each
 job type in a queue. Each state change records its counts as a new row rather

@@ -648,6 +648,38 @@ func TestRaptor(t *testing.T) {
 		assert.NoError(t, err)
 	})
 
+	t.Run("Cleanup_DeadJobs", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		insertDead := func(queue, age string) string {
+			var id string
+			err := db.QueryRow(t.Context(), `
+				INSERT INTO "raptor_dead_jobs" ("queue_name", "job_type", "status", "failed_at")
+				VALUES ($1, 'test.job', 'failed', now() - $2::interval)
+				RETURNING "id"`, queue, age).Scan(&id)
+			require.NoError(t, err)
+			return id
+		}
+		remaining := func() []string {
+			rows, err := db.Query(t.Context(), `SELECT "id"::text FROM "raptor_dead_jobs" WHERE "queue_name" LIKE 'dead-%'`)
+			require.NoError(t, err)
+			ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			require.NoError(t, err)
+			return ids
+		}
+
+		insertDead("dead-a", "31 days")
+		insertDead("dead-a", "30 days")
+		recent := insertDead("dead-a", "29 days")
+		otherQueue := insertDead("dead-b", "31 days")
+
+		require.NoError(t, Cleanup(t.Context(), db, "dead-a"))
+		assert.ElementsMatch(t, []string{recent, otherQueue}, remaining())
+
+		require.NoError(t, Cleanup(t.Context(), db, ""))
+		assert.ElementsMatch(t, []string{recent}, remaining())
+	})
+
 	t.Run("Enqueue_Idempotent", func(t *testing.T) {
 		db := beginTx(t, conn)
 
