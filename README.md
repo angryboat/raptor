@@ -114,7 +114,7 @@ schedule's next run. Turn on its Live toggle to refresh every 5 seconds. It
 does no authentication, so wrap it in your own middleware.
 
 ```go
-mux.Handle("/raptor/", http.StripPrefix("/raptor", requireAdmin(dashboard.New(pool))))
+mux.Handle("/raptor/", http.StripPrefix("/raptor", requireAdmin(password, dashboard.New(pool))))
 ```
 
 ## Development
