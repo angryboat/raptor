@@ -5,6 +5,7 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"math"
 	"math/big"
 	"time"
 
@@ -147,6 +148,10 @@ func Enqueue(ctx context.Context, db DB, job EnqueueJob) (string, error) {
 	return *id, nil
 }
 
+// Claim claims up to limit pending jobs from queue for worker. A positive
+// timeout sets each job's claim TTL, rounded up to whole seconds because TTLs
+// are stored in seconds, so a sub-second timeout claims for one second. A zero
+// or negative timeout keeps each job's existing TTL (5 minutes by default).
 func Claim(ctx context.Context, db DB, queue, worker string, limit int, timeout time.Duration) ([]*Job, error) {
 	if limit <= 0 {
 		limit = 1
@@ -154,7 +159,7 @@ func Claim(ctx context.Context, db DB, queue, worker string, limit int, timeout 
 
 	var claimedTTL any
 	if timeout > 0 {
-		claimedTTL = int32(timeout.Seconds())
+		claimedTTL = ttlSeconds(timeout)
 	}
 
 	rows, err := db.Query(ctx, `SELECT * FROM "raptor_claim_jobs"($1, $2, $3, $4)`,
@@ -216,6 +221,20 @@ func (j *Job) ClaimDeadline() time.Time {
 		return time.Time{}
 	}
 	return j.ClaimedAt.Add(time.Duration(j.ClaimedTTL) * time.Second)
+}
+
+func ttlSeconds(d time.Duration) int32 {
+	secs := d / time.Second
+	if d%time.Second > 0 {
+		secs++
+	}
+	switch {
+	case secs <= 0:
+		return 0
+	case secs > math.MaxInt32:
+		return math.MaxInt32
+	}
+	return int32(secs)
 }
 
 // Complete marks a claimed job as completed. It returns ErrClaimLost if the
