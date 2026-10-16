@@ -368,6 +368,31 @@ func TestHandlerCache(t *testing.T) {
 			assert.Equal(t, int32(1), db.calls.Load())
 		})
 	})
+
+	t.Run("AbandonsAHungLoad", func(t *testing.T) {
+		synctest.Test(t, func(t *testing.T) {
+			db := &gatedDB{release: make(chan struct{})}
+			h := New(db)
+
+			ctx, cancel := context.WithCancel(t.Context())
+			first := make(chan *httptest.ResponseRecorder, 1)
+			go func() { first <- serveContext(ctx, h) }()
+			synctest.Wait()
+			cancel()
+			<-first
+
+			time.Sleep(loadTimeout)
+			synctest.Wait()
+
+			second := make(chan *httptest.ResponseRecorder, 1)
+			go func() { second <- serve(t, h, http.MethodGet) }()
+			synctest.Wait()
+			assert.Equal(t, int32(2), db.calls.Load())
+
+			close(db.release)
+			assert.Contains(t, (<-second).Body.String(), "reading clock: unavailable")
+		})
+	})
 }
 
 func TestFormatRelative(t *testing.T) {

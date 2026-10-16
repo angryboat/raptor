@@ -30,6 +30,8 @@ var tmpl = template.Must(template.New("dashboard").Funcs(template.FuncMap{
 // DefaultCacheTTL is the CacheTTL that New sets.
 const DefaultCacheTTL = 2 * time.Second
 
+const loadTimeout = 30 * time.Second
+
 // Handler serves the dashboard. It does no authentication or authorization,
 // so wrap it in your own middleware before exposing it.
 type Handler struct {
@@ -113,8 +115,10 @@ func (h *Handler) current(ctx context.Context) (snapshot, error) {
 	}
 }
 
-// fill outlives its request so the viewers sharing it don't fail when that one leaves.
+// fill outlives its request so sharers survive it leaving, but is bounded so a hung query can't strand them.
 func (h *Handler) fill(ctx context.Context, f *flight, startedAt time.Time) {
+	ctx, cancel := context.WithTimeout(ctx, loadTimeout)
+	defer cancel()
 	f.snap, f.err = load(ctx, h.db)
 
 	h.mu.Lock()

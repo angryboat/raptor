@@ -149,6 +149,8 @@ Each render reuses data loaded within the last `CacheTTL` (default
 load wait for it, so any number of open dashboards cost the database at most
 one set of queries per TTL. Set `CacheTTL` on the handler before serving to
 change it; zero or less reloads for every request, sharing only a load in flight.
+A load that takes longer than 30 seconds is abandoned, so a hung query fails
+the requests waiting on it instead of stalling the dashboard.
 
 Queue depths come from an index-only scan of `idx_raptor_jobs_queue_depth`, a
 partial index over pending and claimed jobs. `Setup` builds it inside a
