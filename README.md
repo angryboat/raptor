@@ -78,8 +78,12 @@ the runner to settle jobs after the timeout.
   backs off exponentially with jitter, starting around a second and capped at
   an hour, so the default 10 attempts span about 4 to 9 minutes. An error that
   implements `RetryAfterError`, even wrapped, picks its own delay instead,
-  which suits rate limits that say when to come back. Callers that settle jobs
-  themselves get the same from `Fail`, or pass an exact delay to `FailAfter`.
+  which suits rate limits that say when to come back. A worker that knows
+  retrying won't help, like a bad payload, returns `raptor.Permanent(err)`, and
+  the job moves to `raptor_dead_jobs` on that attempt, even when wrapped.
+  `ValueWorkerFunc` does this for payloads it can't decode. Callers that settle
+  jobs themselves get the same from `Fail`, or pass an exact delay to
+  `FailAfter`.
 - **Delays and expiry**: `VisibleAt` holds a job back until that time.
   `ExpiresAt` cancels it if it hasn't run by then.
 - **Deduplication**: while a job with the same `IdempotencyKey`, queue and type
