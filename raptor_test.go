@@ -94,6 +94,37 @@ func TestRaptor(t *testing.T) {
 		assert.Empty(t, more)
 	})
 
+	t.Run("Claim rounds timeout up to whole seconds", func(t *testing.T) {
+		for timeout, ttl := range map[time.Duration]int32{
+			time.Nanosecond:         1,
+			500 * time.Millisecond:  1,
+			time.Second:             1,
+			1900 * time.Millisecond: 2,
+			0:                       300,
+			-time.Second:            300,
+		} {
+			t.Run(timeout.String(), func(t *testing.T) {
+				db := beginTx(t, conn)
+
+				_, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job"})
+				require.NoError(t, err)
+
+				jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, timeout)
+				require.NoError(t, err)
+				require.Len(t, jobs, 1)
+
+				job := jobs[0]
+				assert.Equal(t, ttl, job.ClaimedTTL)
+				require.NotNil(t, job.ClaimedAt)
+				assert.Equal(t, job.ClaimedAt.Add(time.Duration(ttl)*time.Second), job.ClaimDeadline())
+
+				var reaped int
+				require.NoError(t, db.QueryRow(t.Context(), `SELECT "raptor_reap_stuck_jobs"()`).Scan(&reaped))
+				assert.Zero(t, reaped)
+			})
+		}
+	})
+
 	t.Run("Complete", func(t *testing.T) {
 		db := beginTx(t, conn)
 
@@ -545,5 +576,19 @@ func TestBackoff(t *testing.T) {
 			assert.GreaterOrEqual(t, delay, ceiling/2, "attempts %d", attempts)
 			assert.LessOrEqual(t, delay, ceiling, "attempts %d", attempts)
 		}
+	}
+}
+
+func TestTTLSeconds(t *testing.T) {
+	for d, want := range map[time.Duration]int32{
+		time.Nanosecond:               1,
+		999 * time.Millisecond:        1,
+		time.Second:                   1,
+		time.Second + time.Nanosecond: 2,
+		time.Minute:                   60,
+		math.MaxInt32 * time.Second:   math.MaxInt32,
+		time.Duration(math.MaxInt64):  math.MaxInt32,
+	} {
+		assert.Equal(t, want, ttlSeconds(d), "duration %s", d)
 	}
 }
