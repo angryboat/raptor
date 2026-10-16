@@ -54,12 +54,11 @@ type Job struct {
 	FailedAt       *time.Time      `db:"failed_at"`
 	Attempts       int32           `db:"attempts"`
 	MaxAttempts    int32           `db:"max_attempts"`
-	TimeoutMs      int32           `db:"timeout_ms"`
 	FailureInfo    json.RawMessage `db:"failure_info"`
 	IdempotencyKey *string         `db:"idempotency_key"`
 }
 
-const jobColumns = `"id", "queue_name", "job_type", "job_data", "priority", "status", "created_at", "visible_at", "expires_at", "claimed_at", "claimed_by", "claimed_ttl", "completed_at", "cancelled_at", "failed_at", "attempts", "max_attempts", "timeout_ms", "failure_info", "idempotency_key"`
+const jobColumns = `"id", "queue_name", "job_type", "job_data", "priority", "status", "created_at", "visible_at", "expires_at", "claimed_at", "claimed_by", "claimed_ttl", "completed_at", "cancelled_at", "failed_at", "attempts", "max_attempts", "failure_info", "idempotency_key"`
 
 type EnqueueJob struct {
 	Queue          string
