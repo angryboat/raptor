@@ -37,27 +37,29 @@ type DB interface {
 }
 
 type Job struct {
-	ID             string
-	Queue          string
-	Type           string
-	Payload        json.RawMessage
-	Priority       int16
-	Status         string
-	CreatedAt      time.Time
-	VisibleAt      time.Time
-	ExpiresAt      *time.Time
-	ClaimedAt      *time.Time
-	ClaimedBy      *string
-	ClaimedTTL     int32
-	CompletedAt    *time.Time
-	CancelledAt    *time.Time
-	FailedAt       *time.Time
-	Attempts       int32
-	MaxAttempts    int32
-	TimeoutMs      int32
-	FailureInfo    json.RawMessage
-	IdempotencyKey *string
+	ID             string          `db:"id"`
+	Queue          string          `db:"queue_name"`
+	Type           string          `db:"job_type"`
+	Payload        json.RawMessage `db:"job_data"`
+	Priority       int16           `db:"priority"`
+	Status         string          `db:"status"`
+	CreatedAt      time.Time       `db:"created_at"`
+	VisibleAt      time.Time       `db:"visible_at"`
+	ExpiresAt      *time.Time      `db:"expires_at"`
+	ClaimedAt      *time.Time      `db:"claimed_at"`
+	ClaimedBy      *string         `db:"claimed_by"`
+	ClaimedTTL     int32           `db:"claimed_ttl"`
+	CompletedAt    *time.Time      `db:"completed_at"`
+	CancelledAt    *time.Time      `db:"cancelled_at"`
+	FailedAt       *time.Time      `db:"failed_at"`
+	Attempts       int32           `db:"attempts"`
+	MaxAttempts    int32           `db:"max_attempts"`
+	TimeoutMs      int32           `db:"timeout_ms"`
+	FailureInfo    json.RawMessage `db:"failure_info"`
+	IdempotencyKey *string         `db:"idempotency_key"`
 }
+
+const jobColumns = `"id", "queue_name", "job_type", "job_data", "priority", "status", "created_at", "visible_at", "expires_at", "claimed_at", "claimed_by", "claimed_ttl", "completed_at", "cancelled_at", "failed_at", "attempts", "max_attempts", "timeout_ms", "failure_info", "idempotency_key"`
 
 type EnqueueJob struct {
 	Queue          string
@@ -162,7 +164,7 @@ func Claim(ctx context.Context, db DB, queue, worker string, limit int, timeout 
 		claimedTTL = ttlSeconds(timeout)
 	}
 
-	rows, err := db.Query(ctx, `SELECT * FROM "raptor_claim_jobs"($1, $2, $3, $4)`,
+	rows, err := db.Query(ctx, `SELECT `+jobColumns+` FROM "raptor_claim_jobs"($1, $2, $3, $4)`,
 		queue,
 		worker,
 		limit,
@@ -171,42 +173,7 @@ func Claim(ctx context.Context, db DB, queue, worker string, limit int, timeout 
 	if err != nil {
 		return nil, err
 	}
-	defer rows.Close()
-
-	var jobs []*Job
-	for rows.Next() {
-		var job Job
-		if err := rows.Scan(
-			&job.ID,
-			&job.Queue,
-			&job.Type,
-			&job.Payload,
-			&job.Priority,
-			&job.Status,
-			&job.CreatedAt,
-			&job.VisibleAt,
-			&job.ExpiresAt,
-			&job.ClaimedAt,
-			&job.ClaimedBy,
-			&job.ClaimedTTL,
-			&job.CompletedAt,
-			&job.CancelledAt,
-			&job.FailedAt,
-			&job.Attempts,
-			&job.MaxAttempts,
-			&job.TimeoutMs,
-			&job.FailureInfo,
-			&job.IdempotencyKey,
-		); err != nil {
-			return nil, err
-		}
-		jobs = append(jobs, &job)
-	}
-	if err := rows.Err(); err != nil {
-		return nil, err
-	}
-
-	return jobs, nil
+	return pgx.CollectRows(rows, pgx.RowToAddrOfStructByName[Job])
 }
 
 var (
