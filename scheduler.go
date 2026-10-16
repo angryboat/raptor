@@ -424,5 +424,5 @@ func (p parsedSchedule) next(prev, now time.Time) time.Time {
 func rollback(ctx context.Context, tx pgx.Tx) {
 	ctx, cancel := settleContext(ctx)
 	defer cancel()
-	tx.Rollback(ctx)
+	_ = tx.Rollback(ctx)
 }
