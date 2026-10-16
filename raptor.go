@@ -11,6 +11,7 @@ import (
 
 	"github.com/angryboat/raptor/internal/migrate"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 )
 
@@ -128,25 +129,28 @@ func Enqueue(ctx context.Context, db DB, job EnqueueJob) (string, error) {
 		p.idempotencyKey,
 	)
 	if err != nil {
-		return "", err
+		return "", enqueueError(err)
 	}
 	defer rows.Close()
 
-	var id *string
+	var id string
 	if rows.Next() {
 		if err := rows.Scan(&id); err != nil {
 			return "", err
 		}
 	}
 	if err := rows.Err(); err != nil {
-		return "", err
+		return "", enqueueError(err)
 	}
 
-	if id == nil {
-		return "", nil
-	}
+	return id, nil
+}
 
-	return *id, nil
+func enqueueError(err error) error {
+	if pgErr, ok := errors.AsType[*pgconn.PgError](err); ok && pgErr.Code == "RA001" {
+		return errEnqueueMissed
+	}
+	return err
 }
 
 // Claim claims up to limit pending jobs from queue for worker. A positive
@@ -178,6 +182,8 @@ func Claim(ctx context.Context, db DB, queue, worker string, limit int, timeout 
 var (
 	ErrJobNotFound = errors.New("raptor: job not found")
 	ErrClaimLost   = errors.New("raptor: job claim lost")
+
+	errEnqueueMissed = errors.New("raptor: enqueue neither inserted a job nor found one holding its idempotency key")
 )
 
 // ClaimDeadline is when the job's claim expires and Sweep may hand it to

@@ -274,6 +274,21 @@ func TestScheduler(t *testing.T) {
 		assert.Equal(t, before, []scheduleRow{readSchedule(t, db, broken), readSchedule(t, db, hourly)})
 		assert.Zero(t, countJobs(t, db, "test.hourly"))
 	})
+
+	t.Run("Tick rolls back when an enqueue can't settle its idempotency key", func(t *testing.T) {
+		db := beginTx(t, conn)
+		keyed := Schedule{Name: "keyed", Spec: "@hourly", Job: EnqueueJob{Queue: "default", Type: "test.keyed", IdempotencyKey: "keyed"}}
+		s := newTestScheduler(t, keyed)
+		require.NoError(t, s.Sync(t.Context(), db))
+		setNextRunAt(t, db, keyed, "now() - interval '1 second'")
+		before := readSchedule(t, db, keyed)
+		keepStealingKey(t, db, "default", "test.keyed", "keyed")
+
+		_, err := s.Tick(t.Context(), db)
+		require.Error(t, err)
+
+		assert.Equal(t, before, readSchedule(t, db, keyed))
+	})
 }
 
 func TestScheduler_ConcurrentTicks(t *testing.T) {
