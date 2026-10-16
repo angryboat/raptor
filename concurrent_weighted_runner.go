@@ -1,18 +1,22 @@
 package raptor
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"fmt"
 	"log/slog"
 	"runtime"
-	"sort"
+	"slices"
 	"sync"
 	"sync/atomic"
 	"time"
 )
 
 type ConcurrentWeightedRunner struct {
+	// Queue maps queue names to how many jobs each takes per round. Run reads
+	// it once when it starts, so changes made while Run is running have no
+	// effect until the next call.
 	Queue   map[string]int
 	Workers map[string]Worker
 	// Threads is how many jobs Run executes at once. It must be positive;
@@ -46,13 +50,14 @@ func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
 	ctx, cancel := context.WithCancelCause(parent)
 	defer cancel(nil)
 
+	queues := weightedQueues(c.Queue)
 	idle := newIdleWorkers(c.Threads)
 	jobs := make(chan *Job)
 
 	go func() {
 		defer close(jobs)
 		for ctx.Err() == nil && !c.quiet.Load() {
-			if err := c.dequeue(ctx, db, idle, jobs); err != nil {
+			if err := c.dequeue(ctx, db, queues, idle, jobs); err != nil {
 				cancel(err)
 				return
 			}
@@ -85,32 +90,32 @@ func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
 	return nil
 }
 
-// dequeue runs one weighted round: each queue in c.Queue is drained up to
-// its configured weight (or until empty) before moving to the next queue,
-// highest weight first (ties broken by name for determinism). If nothing
-// was claimed this round, it waits out emptyCooldown before returning so
-// the caller's loop doesn't spin.
-func (c *ConcurrentWeightedRunner) dequeue(ctx context.Context, db DB, idle idleWorkers, queue chan<- *Job) error {
-	names := make([]string, 0, len(c.Queue))
-	for name := range c.Queue {
-		names = append(names, name)
+type weightedQueue struct {
+	name   string
+	weight int
+}
+
+func weightedQueues(weights map[string]int) []weightedQueue {
+	queues := make([]weightedQueue, 0, len(weights))
+	for name, weight := range weights {
+		if weight > 0 {
+			queues = append(queues, weightedQueue{name: name, weight: weight})
+		}
 	}
-	sort.Slice(names, func(i, j int) bool {
-		wi, wj := c.Queue[names[i]], c.Queue[names[j]]
-		if wi != wj {
-			return wi > wj
-		}
-		return names[i] < names[j]
+	slices.SortFunc(queues, func(a, b weightedQueue) int {
+		return cmp.Or(cmp.Compare(b.weight, a.weight), cmp.Compare(a.name, b.name))
 	})
+	return queues
+}
 
+// dequeue runs one weighted round: each queue is drained up to its weight (or
+// until empty) before moving to the next, in slice order. If nothing was
+// claimed this round, it waits out emptyCooldown before returning so the
+// caller's loop doesn't spin.
+func (c *ConcurrentWeightedRunner) dequeue(ctx context.Context, db DB, queues []weightedQueue, idle idleWorkers, jobs chan<- *Job) error {
 	var claimedAny bool
-	for _, name := range names {
-		weight := c.Queue[name]
-		if weight <= 0 {
-			continue
-		}
-
-		n, err := c.drainQueue(ctx, db, name, weight, idle, queue)
+	for _, q := range queues {
+		n, err := c.drainQueue(ctx, db, q.name, q.weight, idle, jobs)
 		if err != nil {
 			return err
 		}

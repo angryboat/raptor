@@ -26,7 +26,7 @@ func TestConcurrentWeightedRunner_Dequeue(t *testing.T) {
 		r.Threads = 10 // larger than either weight, so batching can't hide an over-claim
 
 		jobs := make(chan *Job, 10)
-		err := r.dequeue(t.Context(), db, newIdleWorkers(r.Threads), jobs)
+		err := r.dequeue(t.Context(), db, weightedQueues(r.Queue), newIdleWorkers(r.Threads), jobs)
 		require.NoError(t, err)
 		close(jobs)
 
@@ -48,7 +48,7 @@ func TestConcurrentWeightedRunner_Dequeue(t *testing.T) {
 		r.Threads = 4
 
 		jobs := make(chan *Job, 10)
-		err := r.dequeue(t.Context(), db, newIdleWorkers(r.Threads), jobs)
+		err := r.dequeue(t.Context(), db, weightedQueues(r.Queue), newIdleWorkers(r.Threads), jobs)
 		require.NoError(t, err)
 		close(jobs)
 
@@ -68,7 +68,7 @@ func TestConcurrentWeightedRunner_Dequeue(t *testing.T) {
 
 		jobs := make(chan *Job, 1)
 		start := time.Now()
-		err := r.dequeue(t.Context(), db, newIdleWorkers(1), jobs)
+		err := r.dequeue(t.Context(), db, weightedQueues(r.Queue), newIdleWorkers(1), jobs)
 		elapsed := time.Since(start)
 
 		require.NoError(t, err)
@@ -89,12 +89,30 @@ func TestConcurrentWeightedRunner_Dequeue(t *testing.T) {
 
 		jobs := make(chan *Job, 1)
 		start := time.Now()
-		err := r.dequeue(ctx, db, newIdleWorkers(1), jobs)
+		err := r.dequeue(ctx, db, weightedQueues(r.Queue), newIdleWorkers(1), jobs)
 		elapsed := time.Since(start)
 
 		require.NoError(t, err)
 		assert.Less(t, elapsed, 1*time.Second, "context cancellation should interrupt the cooldown wait early")
 	})
+}
+
+func TestWeightedQueues(t *testing.T) {
+	got := weightedQueues(map[string]int{
+		"low":      1,
+		"critical": 5,
+		"b-mid":    3,
+		"a-mid":    3,
+		"off":      0,
+		"negative": -1,
+	})
+
+	assert.Equal(t, []weightedQueue{
+		{name: "critical", weight: 5},
+		{name: "a-mid", weight: 3},
+		{name: "b-mid", weight: 3},
+		{name: "low", weight: 1},
+	}, got)
 }
 
 // TestConcurrentWeightedRunner_Run shares one pool + migration across its
@@ -160,6 +178,38 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 
 		cancel()
 		require.NoError(t, <-done)
+	})
+
+	t.Run("QueueFrozenAtRun", func(t *testing.T) {
+		const queue = "run-frozen-default"
+		const late = "run-frozen-late"
+		enqueueN(t, db, queue, 1)
+		lateIDs := enqueueN(t, db, late, 1)
+
+		worker := &recordingWorker{}
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 1}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		require.Eventually(t, func() bool {
+			return len(worker.ids()) == 1
+		}, 2*time.Second, 10*time.Millisecond, "worker never ran the first job")
+
+		r.Queue[late] = 1
+
+		assert.Never(t, func() bool {
+			return len(worker.ids()) > 1
+		}, 200*time.Millisecond, 10*time.Millisecond, "runner picked up a queue added after Run started")
+
+		cancel()
+		require.NoError(t, <-done)
+		assert.Equal(t, jobState{Status: "pending", Attempts: 0}, readJobState(t, db, lateIDs[0]))
 	})
 
 	t.Run("WorkerError", func(t *testing.T) {
