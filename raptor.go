@@ -57,9 +57,10 @@ type Job struct {
 	MaxAttempts    int32           `db:"max_attempts"`
 	FailureInfo    json.RawMessage `db:"failure_info"`
 	IdempotencyKey *string         `db:"idempotency_key"`
+	ClaimSeq       int64           `db:"claim_seq"`
 }
 
-const jobColumns = `"id", "queue_name", "job_type", "job_data", "priority", "status", "created_at", "visible_at", "expires_at", "claimed_at", "claimed_by", "claimed_ttl", "completed_at", "cancelled_at", "failed_at", "attempts", "max_attempts", "failure_info", "idempotency_key"`
+const jobColumns = `"id", "queue_name", "job_type", "job_data", "priority", "status", "created_at", "visible_at", "expires_at", "claimed_at", "claimed_by", "claimed_ttl", "completed_at", "cancelled_at", "failed_at", "attempts", "max_attempts", "failure_info", "idempotency_key", "claim_seq"`
 
 type EnqueueJob struct {
 	Queue          string
@@ -217,7 +218,7 @@ func ttlSeconds(d time.Duration) int32 {
 // Complete marks a claimed job as completed. It returns ErrClaimLost if the
 // job was reaped, reclaimed, cancelled or settled since job was claimed.
 func Complete(ctx context.Context, db DB, job *Job) error {
-	return settleClaim(ctx, db, `SELECT "raptor_complete_job"($1, $2, $3)`, job.ID, job.ClaimedBy, job.Attempts)
+	return settleClaim(ctx, db, `SELECT "raptor_complete_job"($1, $2, $3)`, job.ID, job.ClaimedBy, job.ClaimSeq)
 }
 
 func Cancel(ctx context.Context, db DB, jobID string) error {
@@ -301,7 +302,7 @@ func FailAfter(ctx context.Context, db DB, job *Job, failure error, delay time.D
 
 	_, permanent := errors.AsType[*permanentError](failure)
 
-	return settleClaim(ctx, db, `SELECT "raptor_fail_job"($1, $2, $3, $4, $5, $6)`, job.ID, job.ClaimedBy, job.Attempts, infoJSON, delay, permanent)
+	return settleClaim(ctx, db, `SELECT "raptor_fail_job"($1, $2, $3, $4, $5, $6)`, job.ID, job.ClaimedBy, job.ClaimSeq, infoJSON, delay, permanent)
 }
 
 func retryDelay(attempts int32, failure error) time.Duration {
@@ -328,7 +329,7 @@ func randDuration(limit time.Duration) time.Duration {
 // counting the claim as an attempt. It returns ErrClaimLost if the job was
 // reaped, reclaimed, cancelled or settled since job was claimed.
 func Release(ctx context.Context, db DB, job *Job) error {
-	return settleClaim(ctx, db, `SELECT "raptor_release_job"($1, $2, $3)`, job.ID, job.ClaimedBy, job.Attempts)
+	return settleClaim(ctx, db, `SELECT "raptor_release_job"($1, $2, $3)`, job.ID, job.ClaimedBy, job.ClaimSeq)
 }
 
 func settleClaim(ctx context.Context, db DB, query string, args ...any) error {
