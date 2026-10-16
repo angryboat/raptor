@@ -1063,6 +1063,98 @@ func TestEnqueue_KeyFreedConcurrently(t *testing.T) {
 	assert.Equal(t, int64(2), globalTotals(t, pool).Jobs)
 }
 
+func TestClaim_Concurrent(t *testing.T) {
+	pool := test.CreatePool(t)
+	require.NoError(t, SetupPool(t.Context(), pool))
+
+	const (
+		claimers = 8
+		rounds   = 10
+		jobs     = 40
+	)
+	for round := 1; round <= rounds; round++ {
+		queue := fmt.Sprintf("claim-race-%d", round)
+		want := enqueueN(t, pool, queue, jobs)
+
+		start := make(chan struct{})
+		claimed := make([][]string, claimers)
+		errs := make([]error, claimers)
+
+		var wg sync.WaitGroup
+		for i := range claimers {
+			wg.Go(func() {
+				<-start
+				for {
+					got, err := Claim(t.Context(), pool, queue, fmt.Sprintf("worker-%d", i), 3, time.Minute)
+					if err != nil {
+						errs[i] = err
+						return
+					}
+					if len(got) == 0 {
+						return
+					}
+					for _, job := range got {
+						claimed[i] = append(claimed[i], job.ID)
+					}
+				}
+			})
+		}
+		close(start)
+		wg.Wait()
+
+		var all []string
+		for i := range claimers {
+			require.NoError(t, errs[i])
+			all = append(all, claimed[i]...)
+		}
+		assert.ElementsMatch(t, want, all, "round %d: every job claimed exactly once", round)
+	}
+}
+
+func TestSweep_ConcurrentExpire(t *testing.T) {
+	pool := test.CreatePool(t)
+	require.NoError(t, SetupPool(t.Context(), pool))
+
+	const (
+		sweepers = 8
+		rounds   = 10
+		jobs     = 40
+	)
+	for round := 1; round <= rounds; round++ {
+		queue := fmt.Sprintf("expire-race-%d", round)
+		for range jobs {
+			_, err := Enqueue(t.Context(), pool, EnqueueJob{
+				Queue:     queue,
+				Type:      "test.job",
+				ExpiresAt: time.Now().Add(-time.Minute),
+			})
+			require.NoError(t, err)
+		}
+		before := globalTotals(t, pool).Cancelled
+
+		start := make(chan struct{})
+		errs := make([]error, sweepers)
+
+		var wg sync.WaitGroup
+		for i := range sweepers {
+			wg.Go(func() {
+				<-start
+				errs[i] = Sweep(t.Context(), pool, queue)
+			})
+		}
+		close(start)
+		wg.Wait()
+
+		for i := range sweepers {
+			require.NoError(t, errs[i])
+		}
+		stat, err := LoadQueueStat(t.Context(), pool, queue)
+		require.NoError(t, err)
+		assert.Equal(t, uint64(jobs), stat.Jobs["test.job"].CancelledCount, "round %d", round)
+		assert.Equal(t, int64(jobs), globalTotals(t, pool).Cancelled-before, "round %d", round)
+	}
+}
+
 func TestPermanent(t *testing.T) {
 	assert.NoError(t, Permanent(nil))
 
