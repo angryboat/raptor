@@ -88,6 +88,8 @@ the runner to settle jobs after the timeout.
 - **Claims**: a worker's context has a deadline at the end of its claim (5
   minutes by default). After that, `Sweep` may give the job to another worker.
   The original worker's `Complete` or `Fail` then returns `ErrClaimLost`.
+  Claim TTLs are whole seconds, so `Claim` rounds its timeout up: 500ms claims
+  for one second and 1.5s for two.
 
 ## Scheduled jobs
 
