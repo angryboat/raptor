@@ -141,7 +141,7 @@ func Enqueue(ctx context.Context, db DB, job EnqueueJob) (string, error) {
 	}
 
 	if id == nil {
-		return "", nil
+		return "", errEnqueueMissed
 	}
 
 	return *id, nil
@@ -207,6 +207,8 @@ func Claim(ctx context.Context, db DB, queue, worker string, limit int, timeout 
 var (
 	ErrJobNotFound = errors.New("raptor: job not found")
 	ErrClaimLost   = errors.New("raptor: job claim lost")
+
+	errEnqueueMissed = errors.New("raptor: enqueue neither inserted a job nor found one holding its idempotency key")
 )
 
 // ClaimDeadline is when the job's claim expires and Sweep may hand it to

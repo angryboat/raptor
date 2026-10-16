@@ -67,7 +67,8 @@ then returns, which is handy for tests and scripts.
 - **Delays and expiry**: `VisibleAt` holds a job back until that time.
   `ExpiresAt` cancels it if it hasn't run by then.
 - **Deduplication**: while a job with the same `IdempotencyKey`, queue and type
-  is pending or claimed, enqueueing another returns the existing job's ID.
+  is pending or claimed, enqueueing another returns the existing job's ID. If
+  that job finishes mid-enqueue, the key is free and a new job is enqueued.
 - **Claims**: a worker's context has a deadline at the end of its claim (5
   minutes by default). After that, `Sweep` may give the job to another worker.
   The original worker's `Complete` or `Fail` then returns `ErrClaimLost`.
