@@ -15,8 +15,8 @@ import (
 
 type ConcurrentWeightedRunner struct {
 	// Queue maps queue names to how many jobs each takes per round. Run reads
-	// it once when it starts, so changes made while Run is running have no
-	// effect until the next call.
+	// Queue, Workers and Threads without locking, so they must not be changed
+	// while Run is running.
 	Queue   map[string]int
 	Workers map[string]Worker
 	// Threads is how many jobs Run executes at once. It must be positive;

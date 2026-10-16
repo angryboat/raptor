@@ -51,23 +51,23 @@ return runner.Run(ctx, pool)
 
 `Run` blocks until `ctx` is cancelled, then finishes the jobs it's already
 running. Each round it takes up to a queue's weight in jobs, starting with the
-highest-weight queue. It reads the weights once when it starts, so changes to
-`Queue` apply on the next `Run`. It claims a job only when one of its `Threads` workers
+highest-weight queue. It claims a job only when one of its `Threads` workers
 is free to start it, so a claim's deadline never runs out while the job waits
 in line. `Threads` defaults to the number of CPUs, and `Run` returns an error
-if it isn't positive. `SerialRunner` empties its queues one job at a time and
-then returns, which is handy for tests and scripts.
+if it isn't positive. Don't change `Queue`, `Workers` or `Threads` while `Run`
+is running; it reads them without locking. `SerialRunner` empties its queues
+one job at a time and then returns, which is handy for tests and scripts.
 
 ## Jobs
 
 - **Retries**: a worker that returns an error or panics fails the job, as does
-  a job whose type has no registered worker. It retries until it has used `MaxAttempts` (10 by default), then moves to
-  `raptor_dead_jobs`. Each retry backs off exponentially with jitter, starting
-  around a second and capped at an hour, so the default 10 attempts span about
-  4 to 9 minutes. An error that implements `RetryAfterError`, even wrapped,
-  picks its own delay instead, which suits rate limits that say when to come
-  back. Callers that settle jobs themselves get the same from `Fail`, or pass
-  an exact delay to `FailAfter`.
+  a job whose type has no registered worker. It retries until it has used
+  `MaxAttempts` (10 by default), then moves to `raptor_dead_jobs`. Each retry
+  backs off exponentially with jitter, starting around a second and capped at
+  an hour, so the default 10 attempts span about 4 to 9 minutes. An error that
+  implements `RetryAfterError`, even wrapped, picks its own delay instead,
+  which suits rate limits that say when to come back. Callers that settle jobs
+  themselves get the same from `Fail`, or pass an exact delay to `FailAfter`.
 - **Delays and expiry**: `VisibleAt` holds a job back until that time.
   `ExpiresAt` cancels it if it hasn't run by then.
 - **Deduplication**: while a job with the same `IdempotencyKey`, queue and type
