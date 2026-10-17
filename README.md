@@ -25,7 +25,8 @@ if err := raptor.SetupPool(ctx, pool); err != nil {
 ```
 
 Enqueue a job. Pass a `pgx.Tx` instead of the pool to enqueue it in a
-transaction.
+transaction. `Queue` and `Type` must be 1-64 characters and
+`IdempotencyKey` at most 128; `Enqueue` returns an error otherwise.
 
 ```go
 _, err := raptor.Enqueue(ctx, pool, raptor.EnqueueJob{

@@ -135,8 +135,8 @@ func parseSchedule(sched Schedule) (parsedSchedule, error) {
 		return parsedSchedule{}, err
 	}
 
-	if err := validateScheduledJob(sched.Job); err != nil {
-		return parsedSchedule{}, err
+	if !sched.Job.VisibleAt.IsZero() || !sched.Job.ExpiresAt.IsZero() {
+		return parsedSchedule{}, errors.New("job VisibleAt and ExpiresAt must be zero")
 	}
 	job, err := newEnqueueParams(sched.Job)
 	if err != nil {
@@ -174,20 +174,6 @@ func validateInterval(spec string) error {
 	}
 	if d < time.Second || d%time.Second != 0 {
 		return fmt.Errorf("interval %v must be a positive number of whole seconds", d)
-	}
-	return nil
-}
-
-func validateScheduledJob(job EnqueueJob) error {
-	switch {
-	case utf8.RuneCountInString(job.Queue) > 64:
-		return errors.New("job queue must be at most 64 characters")
-	case utf8.RuneCountInString(job.Type) > 64:
-		return errors.New("job type must be at most 64 characters")
-	case utf8.RuneCountInString(job.IdempotencyKey) > 128:
-		return errors.New("job idempotency key must be at most 128 characters")
-	case !job.VisibleAt.IsZero() || !job.ExpiresAt.IsZero():
-		return errors.New("job VisibleAt and ExpiresAt must be zero")
 	}
 	return nil
 }

@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 	"time"
+	"unicode/utf8"
 
 	"github.com/angryboat/raptor/internal/migrate"
 	"github.com/jackc/pgx/v5"
@@ -85,6 +87,10 @@ type enqueueParams struct {
 }
 
 func newEnqueueParams(job EnqueueJob) (enqueueParams, error) {
+	if err := validateEnqueueJob(job); err != nil {
+		return enqueueParams{}, err
+	}
+
 	payload, err := json.Marshal(job.Payload)
 	if err != nil {
 		return enqueueParams{}, err
@@ -113,10 +119,27 @@ func newEnqueueParams(job EnqueueJob) (enqueueParams, error) {
 	return p, nil
 }
 
+func validateEnqueueJob(job EnqueueJob) error {
+	switch {
+	case !lengthWithin(job.Queue, 1, 64):
+		return errors.New("job queue must be 1-64 characters")
+	case !lengthWithin(job.Type, 1, 64):
+		return errors.New("job type must be 1-64 characters")
+	case !lengthWithin(job.IdempotencyKey, 0, 128):
+		return errors.New("job idempotency key must be at most 128 characters")
+	}
+	return nil
+}
+
+func lengthWithin(s string, minLen, maxLen int) bool {
+	n := utf8.RuneCountInString(s)
+	return n >= minLen && n <= maxLen
+}
+
 func Enqueue(ctx context.Context, db DB, job EnqueueJob) (string, error) {
 	p, err := newEnqueueParams(job)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("raptor: %w", err)
 	}
 
 	rows, err := db.Query(ctx, `SELECT "raptor_enqueue_job"($1, $2, $3, $4, $5, $6, $7, $8)`,

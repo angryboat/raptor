@@ -66,6 +66,40 @@ func TestRaptor(t *testing.T) {
 		assert.NotEmpty(t, id)
 	})
 
+	t.Run("Enqueue_LengthLimits", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:          strings.Repeat("q", 64),
+			Type:           strings.Repeat("é", 64),
+			IdempotencyKey: strings.Repeat("é", 128),
+		})
+		require.NoError(t, err)
+		assert.NotEmpty(t, id)
+	})
+
+	for name, tc := range map[string]struct {
+		job  EnqueueJob
+		want string
+	}{
+		"empty queue":    {EnqueueJob{Type: "test.job"}, "raptor: job queue must be 1-64 characters"},
+		"queue too long": {EnqueueJob{Queue: strings.Repeat("q", 65), Type: "test.job"}, "raptor: job queue must be 1-64 characters"},
+		"empty type":     {EnqueueJob{Queue: "default"}, "raptor: job type must be 1-64 characters"},
+		"type too long":  {EnqueueJob{Queue: "default", Type: strings.Repeat("t", 65)}, "raptor: job type must be 1-64 characters"},
+		"key too long":   {EnqueueJob{Queue: "default", Type: "test.job", IdempotencyKey: strings.Repeat("k", 129)}, "raptor: job idempotency key must be at most 128 characters"},
+	} {
+		t.Run("Enqueue_Invalid/"+name, func(t *testing.T) {
+			db := beginTx(t, conn)
+
+			_, err := Enqueue(t.Context(), db, tc.job)
+			assert.EqualError(t, err, tc.want)
+
+			var n int
+			require.NoError(t, db.QueryRow(t.Context(), `SELECT count(*) FROM "raptor_jobs"`).Scan(&n))
+			assert.Zero(t, n)
+		})
+	}
+
 	t.Run("Claim", func(t *testing.T) {
 		db := beginTx(t, conn)
 
