@@ -70,6 +70,12 @@ they should be idempotent, and workers must return when their context ends,
 since the runner still waits for them. Leave room within the grace period for
 the runner to settle jobs after the timeout.
 
+Each job's context ends with its claim, 5 minutes by default, and a job still
+running then can be reaped by `Sweep` and run again elsewhere. Set
+`ClaimTimeout` on either runner to claim for longer than the slowest job. It
+also caps how long a default shutdown waits. The TTL is stored on the job, so a
+runner without `ClaimTimeout` that later claims it keeps the last one set.
+
 Call `Quiet` to stop a runner claiming new jobs without stopping the ones it
 has, say from a pre-stop hook while the load balancer drains. Jobs already
 claimed run and settle as usual, including one last batch from a claim that
@@ -99,7 +105,7 @@ down.
   is pending or claimed, enqueueing another returns the existing job's ID. If
   that job finishes mid-enqueue, the key is free and a new job is enqueued.
 - **Claims**: a worker's context has a deadline at the end of its claim (5
-  minutes by default). After that, `Sweep` may give the job to another worker.
+  minutes by default, or the runner's `ClaimTimeout`). After that, `Sweep` may give the job to another worker.
   The original worker's `Complete` or `Fail` then returns `ErrClaimLost`.
   `Complete`, `Fail` and `Release` return `ErrClaimLost` whenever the job
   still exists but the caller's claim no longer holds: it was reaped,
