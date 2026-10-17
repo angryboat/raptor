@@ -159,9 +159,7 @@ const totalsQuery = `
 const queuesQuery = `
 	SELECT q."name",
 		coalesce(a."ready", 0), coalesce(a."delayed", 0), coalesce(a."retrying", 0), coalesce(a."running", 0),
-		coalesce(a."expired", 0),
-		coalesce(s."completed", 0), coalesce(s."failed", 0), coalesce(s."cancelled", 0), coalesce(s."dead", 0),
-		coalesce(s."duration_ms", 0)
+		coalesce(a."expired", 0)
 	FROM "raptor_queues" q
 	LEFT JOIN (
 		SELECT "queue_name",
@@ -177,14 +175,6 @@ const queuesQuery = `
 		) j
 		GROUP BY "queue_name"
 	) a ON a."queue_name" = q."name"
-	LEFT JOIN (
-		SELECT "queue_name",
-			sum("completed_count")::bigint AS "completed", sum("failed_count")::bigint AS "failed",
-			sum("cancelled_count")::bigint AS "cancelled", sum("dead_count")::bigint AS "dead",
-			sum("total_duration_ms")::bigint AS "duration_ms"
-		FROM "raptor_job_stat_totals"
-		GROUP BY "queue_name"
-	) s ON s."queue_name" = q."name"
 	ORDER BY q."name"`
 
 const jobTypesQuery = `
@@ -236,11 +226,11 @@ func load(ctx context.Context, db raptor.DB) (snapshot, error) {
 	if s.Totals, err = collect[totals](ctx, db, totalsQuery); err != nil {
 		return s, fmt.Errorf("loading totals: %w", err)
 	}
-	if s.Queues, err = collect[queue](ctx, db, queuesQuery); err != nil {
-		return s, fmt.Errorf("loading queues: %w", err)
-	}
 	if s.JobTypes, err = collect[jobType](ctx, db, jobTypesQuery); err != nil {
 		return s, fmt.Errorf("loading job types: %w", err)
+	}
+	if s.Queues, err = loadQueues(ctx, db, s.JobTypes); err != nil {
+		return s, fmt.Errorf("loading queues: %w", err)
 	}
 	if s.Schedules, err = collect[schedule](ctx, db, schedulesQuery); err != nil {
 		return s, fmt.Errorf("loading schedules: %w", err)
@@ -256,6 +246,38 @@ func load(ctx context.Context, db raptor.DB) (snapshot, error) {
 	}
 
 	return s, nil
+}
+
+func loadQueues(ctx context.Context, db raptor.DB, jobTypes []jobType) ([]queue, error) {
+	rows, err := db.Query(ctx, queuesQuery)
+	if err != nil {
+		return nil, err
+	}
+	queues, err := pgx.CollectRows(rows, func(row pgx.CollectableRow) (queue, error) {
+		var q queue
+		err := row.Scan(&q.Name, &q.Ready, &q.Delayed, &q.Retrying, &q.Running, &q.Expired)
+		return q, err
+	})
+	if err != nil {
+		return nil, err
+	}
+
+	byName := make(map[string]*queue, len(queues))
+	for i := range queues {
+		byName[queues[i].Name] = &queues[i]
+	}
+	for _, t := range jobTypes {
+		q, ok := byName[t.Queue]
+		if !ok {
+			continue
+		}
+		q.Completed += t.Completed
+		q.Failed += t.Failed
+		q.Cancelled += t.Cancelled
+		q.Dead += t.Dead
+		q.DurationMs += t.DurationMs
+	}
+	return queues, nil
 }
 
 func collect[T any](ctx context.Context, db raptor.DB, query string, args ...any) ([]T, error) {

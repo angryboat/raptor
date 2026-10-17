@@ -102,6 +102,58 @@ func TestLoad(t *testing.T) {
 		assert.Equal(t, before.JobTypes, after.JobTypes)
 	})
 
+	t.Run("QueuesWithoutStats", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		_, err := raptor.Enqueue(t.Context(), db, raptor.EnqueueJob{Queue: "fresh", Type: "fresh.job"})
+		require.NoError(t, err)
+		exec(t, db, `INSERT INTO "raptor_queues" ("name") VALUES ('idle')`)
+		exec(t, db, `INSERT INTO "raptor_job_stat_events" ("queue_name", "job_type", "completed_count") VALUES ('gone', 'gone.job', 2)`)
+
+		snap, err := load(t.Context(), db)
+		require.NoError(t, err)
+
+		assert.Equal(t, []queue{
+			{Name: "fresh", Ready: 1},
+			{Name: "idle"},
+		}, snap.Queues)
+		assert.Equal(t, []jobType{
+			{Queue: "fresh", Type: "fresh.job"},
+			{Queue: "gone", Type: "gone.job", Completed: 2},
+		}, snap.JobTypes)
+	})
+
+	t.Run("SumsQueueStatsAcrossJobTypes", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		for _, typ := range []string{"mail.send", "mail.digest"} {
+			_, err := raptor.Enqueue(t.Context(), db, raptor.EnqueueJob{Queue: "mail", Type: typ})
+			require.NoError(t, err)
+		}
+		exec(t, db, `INSERT INTO "raptor_job_stat_events" ("queue_name", "job_type", "completed_count", "total_duration_ms") VALUES
+			('mail', 'mail.send', 2, 300), ('mail', 'mail.digest', 1, 100)`)
+
+		snap, err := load(t.Context(), db)
+		require.NoError(t, err)
+
+		assert.Equal(t, []queue{
+			{Name: "mail", Ready: 2, Completed: 3, DurationMs: 400},
+		}, snap.Queues)
+	})
+
+	t.Run("ReadsJobStatsOnce", func(t *testing.T) {
+		db := &recordingDB{DB: beginTx(t, conn)}
+
+		_, err := load(t.Context(), db)
+		require.NoError(t, err)
+
+		var reads int
+		for _, sql := range db.queries {
+			reads += strings.Count(sql, `"raptor_job_stat_`)
+		}
+		assert.Equal(t, 1, reads)
+	})
+
 	t.Run("WindowsSumDayRows", func(t *testing.T) {
 		db := beginTx(t, conn)
 
@@ -579,6 +631,16 @@ func (d *countingDB) Query(ctx context.Context, sql string, args ...any) (pgx.Ro
 	if sql == `SELECT now()` {
 		d.loads.Add(1)
 	}
+	return d.DB.Query(ctx, sql, args...)
+}
+
+type recordingDB struct {
+	raptor.DB
+	queries []string
+}
+
+func (d *recordingDB) Query(ctx context.Context, sql string, args ...any) (pgx.Rows, error) {
+	d.queries = append(d.queries, sql)
 	return d.DB.Query(ctx, sql, args...)
 }
 
