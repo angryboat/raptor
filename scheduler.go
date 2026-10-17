@@ -63,7 +63,9 @@ type Scheduler struct {
 	// Interval is the longest Run waits between checks for due schedules. Run
 	// wakes when the next schedule is due, so Interval only bounds how long it
 	// takes to notice a schedule another process stored or failed to enqueue.
-	// It defaults to one minute.
+	// When another Scheduler holds a due schedule, Run checks again after a
+	// short backoff, and waits Interval only if it stays held for about a
+	// second. It defaults to one minute.
 	Interval time.Duration
 
 	schedules map[string]parsedSchedule
@@ -228,20 +230,33 @@ func shutdownErr(ctx context.Context, err error) error {
 	return err
 }
 
-func (s *Scheduler) poll(ctx context.Context, db TxDB) (time.Duration, error) {
-	wait, err := s.untilDue(ctx, db)
-	if err != nil || wait > 0 {
-		return wait, err
-	}
+const (
+	lostTickBackoff = 250 * time.Millisecond
+	lostTickRetries = 4
+)
 
-	n, err := s.Tick(ctx, db)
-	if err != nil {
-		return 0, err
+func (s *Scheduler) poll(ctx context.Context, db TxDB) (time.Duration, error) {
+	for attempt := 0; ; attempt++ {
+		wait, err := s.untilDue(ctx, db)
+		if err != nil || wait > 0 {
+			return wait, err
+		}
+
+		n, err := s.Tick(ctx, db)
+		if err != nil || n > 0 {
+			return 0, err
+		}
+		if attempt == lostTickRetries {
+			return s.Interval, nil
+		}
+
+		// Another Scheduler holds or just advanced the due row; look again once it commits.
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(lostTickBackoff):
+		}
 	}
-	if n == 0 {
-		return s.Interval, nil
-	}
-	return 0, nil
 }
 
 type earliestDue struct {

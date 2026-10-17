@@ -122,7 +122,9 @@ return scheduler.Run(ctx, pool)
 
 Specs are cron expressions, descriptors like `@daily`, or `@every <duration>`
 with a whole number of seconds, in UTC unless prefixed with `CRON_TZ=`. `Run` wakes when a schedule is due and
-otherwise checks every `Interval` (one minute by default).
+otherwise checks every `Interval` (one minute by default). A replica that loses
+a tick to another checks again a moment later, so it takes over if the winner
+stops.
 
 A stored schedule is identified by its name and spec, so changing either makes
 a new schedule. During a rolling deploy, old and new replicas each run their
