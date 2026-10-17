@@ -80,10 +80,12 @@ func dsnFor(dbName string) string {
 	return "postgres://postgres:password@localhost:5432/" + dbName + "?sslmode=disable"
 }
 
+const createDBTimeout = 10 * time.Second
+
 func createDBWithName(t testing.TB, dbName string) {
 	t.Helper()
 
-	ctx, cancel := context.WithTimeout(t.Context(), 1*time.Second)
+	ctx, cancel := context.WithTimeout(t.Context(), createDBTimeout)
 	defer cancel()
 
 	conn, err := pgx.Connect(ctx, "postgres://postgres:password@localhost:5432/postgres?sslmode=disable")

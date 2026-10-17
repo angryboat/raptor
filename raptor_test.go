@@ -96,6 +96,28 @@ func TestRaptor(t *testing.T) {
 		assert.Empty(t, more)
 	})
 
+	t.Run("Claim_Priority", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		now := time.Now()
+		low, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "priority", Type: "test.job", Priority: 0, VisibleAt: now.Add(-time.Hour)})
+		require.NoError(t, err)
+		high, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "priority", Type: "test.job", Priority: 10, VisibleAt: now.Add(-time.Minute)})
+		require.NoError(t, err)
+		mid, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "priority", Type: "test.job", Priority: 5, VisibleAt: now.Add(-30 * time.Minute)})
+		require.NoError(t, err)
+
+		var claimed []string
+		for range 3 {
+			jobs, err := Claim(t.Context(), db, "priority", "worker-1", 1, time.Minute)
+			require.NoError(t, err)
+			require.Len(t, jobs, 1)
+			claimed = append(claimed, jobs[0].ID)
+		}
+
+		assert.Equal(t, []string{high, mid, low}, claimed)
+	})
+
 	t.Run("Claim rounds timeout up to whole seconds", func(t *testing.T) {
 		for timeout, ttl := range map[time.Duration]int32{
 			time.Nanosecond:         1,
@@ -321,6 +343,56 @@ func TestRaptor(t *testing.T) {
 		require.NoError(t, Sweep(t.Context(), db, "sweep-delay"))
 
 		assert.Equal(t, 30*time.Second, retryDelayOf(t, db, id))
+	})
+
+	t.Run("Sweep_ReapDead", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		job := claimNew(t, db, EnqueueJob{Queue: "sweep-dead", Type: "test.job", MaxAttempts: 1})
+
+		_, err := db.Exec(t.Context(), `UPDATE "raptor_jobs" SET "claimed_at" = now() - INTERVAL '1 hour' WHERE "id" = $1`, job.ID)
+		require.NoError(t, err)
+
+		require.NoError(t, Sweep(t.Context(), db, "sweep-dead"))
+
+		assert.Equal(t, "claim timeout", deadFailure(t, db, job.ID))
+
+		var live bool
+		require.NoError(t, db.QueryRow(t.Context(), `SELECT EXISTS (SELECT 1 FROM "raptor_jobs" WHERE "id" = $1)`, job.ID).Scan(&live))
+		assert.False(t, live)
+
+		stat, err := LoadQueueStat(t.Context(), db, "sweep-dead")
+		require.NoError(t, err)
+		assert.Equal(t, uint64(1), stat.Jobs["test.job"].DeadCount)
+	})
+
+	t.Run("Sweep_AllQueues", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		var stuck []string
+		for _, queue := range []string{"sweep-all-a", "sweep-all-b"} {
+			job := claimNew(t, db, EnqueueJob{Queue: queue, Type: "test.job", MaxAttempts: 3})
+			stuck = append(stuck, job.ID)
+		}
+		_, err := db.Exec(t.Context(), `UPDATE "raptor_jobs" SET "claimed_at" = now() - INTERVAL '1 hour' WHERE "id" = ANY($1)`, stuck)
+		require.NoError(t, err)
+
+		var expired []string
+		for _, queue := range []string{"sweep-all-c", "sweep-all-d"} {
+			id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: queue, Type: "test.job", ExpiresAt: time.Now().Add(-time.Minute)})
+			require.NoError(t, err)
+			expired = append(expired, id)
+		}
+
+		require.NoError(t, Sweep(t.Context(), db, ""))
+
+		for _, id := range stuck {
+			assert.Equal(t, jobState{Status: "pending", Attempts: 1}, readJobState(t, db, id))
+			assert.Equal(t, 30*time.Second, retryDelayOf(t, db, id))
+		}
+		for _, id := range expired {
+			assert.Equal(t, "cancelled", readJobState(t, db, id).Status)
+		}
 	})
 
 	t.Run("Fail_Dead", func(t *testing.T) {
