@@ -172,15 +172,21 @@ A load that takes longer than 30 seconds is abandoned, so a hung query fails
 the requests waiting on it instead of stalling the dashboard.
 
 Queue depths come from an index-only scan of `idx_raptor_jobs_queue_depth`, a
-partial index over pending and claimed jobs. `Setup` builds it inside a
-transaction, which blocks writes to `raptor_jobs` while it runs. On a large
-table, build it first without blocking and `Setup` will skip it. If the
-build fails, drop the invalid index it leaves before running `Setup`.
+partial index over pending and claimed jobs, and the retrying list reads the
+newest failures from `idx_raptor_jobs_retrying`, a partial index over pending
+jobs that have failed. `Setup` builds each inside a transaction, which blocks
+writes to `raptor_jobs` while it runs. On a large table, build them first
+without blocking and `Setup` will skip them. If a build fails, drop the
+invalid index it leaves before running `Setup`.
 
 ```sql
 CREATE INDEX CONCURRENTLY "idx_raptor_jobs_queue_depth" ON "raptor_jobs"
   ("queue_name", "status", "visible_at", "failed_at", "expires_at")
   WHERE "status" IN ('pending', 'claimed');
+
+CREATE INDEX CONCURRENTLY "idx_raptor_jobs_retrying" ON "raptor_jobs"
+  ("failed_at" DESC)
+  WHERE "status" = 'pending' AND "failed_at" IS NOT NULL;
 ```
 
 ## Development

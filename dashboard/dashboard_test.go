@@ -198,6 +198,22 @@ func TestLoad(t *testing.T) {
 		assert.Contains(t, strings.Join(plan, "\n"), `Index Only Scan using idx_raptor_jobs_queue_depth on raptor_jobs`)
 	})
 
+	t.Run("RetryingReadsTheIndexInOrder", func(t *testing.T) {
+		db := beginTx(t, conn)
+		seed(t, db)
+		exec(t, db, `SET LOCAL enable_seqscan = off`)
+		exec(t, db, `SET LOCAL enable_bitmapscan = off`)
+
+		rows, err := db.Query(t.Context(), `EXPLAIN `+retryingQuery, listLimit)
+		require.NoError(t, err)
+		plan, err := pgx.CollectRows(rows, pgx.RowTo[string])
+		require.NoError(t, err)
+
+		joined := strings.Join(plan, "\n")
+		assert.Contains(t, joined, `Index Scan using idx_raptor_jobs_retrying on raptor_jobs`)
+		assert.NotContains(t, joined, `Sort`)
+	})
+
 	t.Run("CapsLists", func(t *testing.T) {
 		db := beginTx(t, conn)
 
