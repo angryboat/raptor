@@ -190,6 +190,7 @@ var (
 	ErrClaimLost = errors.New("raptor: job claim lost")
 
 	errEnqueueMissed = errors.New("raptor: enqueue neither inserted a job nor found one holding its idempotency key")
+	errSettleNoRow   = errors.New("raptor: settle returned no row")
 )
 
 // ClaimDeadline is when the job's claim expires and Sweep may hand it to
@@ -339,12 +340,18 @@ func settleClaim(ctx context.Context, db DB, query string, args ...any) error {
 	}
 	defer rows.Close()
 
-	var status string
-	if rows.Next() {
-		if err := rows.Scan(&status); err != nil {
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
 			return err
 		}
+		return errSettleNoRow
 	}
+
+	var status string
+	if err := rows.Scan(&status); err != nil {
+		return err
+	}
+	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}

@@ -849,6 +849,15 @@ func TestRaptor(t *testing.T) {
 		}
 	})
 
+	t.Run("Settle_NoRow", func(t *testing.T) {
+		db := noRowsDB{DB: beginTx(t, conn)}
+		job := &Job{ID: "00000000-0000-0000-0000-000000000000"}
+
+		assert.ErrorIs(t, Complete(t.Context(), db, job), errSettleNoRow)
+		assert.ErrorIs(t, Fail(t.Context(), db, job, errors.New("boom")), errSettleNoRow)
+		assert.ErrorIs(t, Release(t.Context(), db, job), errSettleNoRow)
+	})
+
 	t.Run("ExecuteJob_Cancelled", func(t *testing.T) {
 		for name, worker := range map[string]*recordingWorker{
 			"Succeeds": {},
