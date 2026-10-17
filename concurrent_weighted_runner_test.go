@@ -4,6 +4,7 @@ import (
 	"context"
 	"errors"
 	"fmt"
+	"sync"
 	"testing"
 	"time"
 
@@ -360,6 +361,57 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 		assert.Zero(t, countClaimed(t, db, queue))
 	})
 
+	t.Run("ClaimTimeoutSetsClaimTTL", func(t *testing.T) {
+		const queue = "run-claim-timeout"
+		enqueueN(t, db, queue, 1)
+
+		type claim struct {
+			ttl      int32
+			deadline time.Time
+			claimed  time.Time
+		}
+		claims := make(chan claim, 1)
+		worker := ValueWorkerFunc(func(ctx context.Context, job *Job, _ any) error {
+			deadline, _ := ctx.Deadline()
+			claims <- claim{ttl: job.ClaimedTTL, deadline: deadline, claimed: *job.ClaimedAt}
+			return nil
+		})
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 1}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.ClaimTimeout = 2 * time.Hour
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		var got claim
+		select {
+		case got = <-claims:
+		case <-time.After(3 * time.Second):
+			t.Fatal("worker never ran the job")
+		}
+		cancel()
+		require.NoError(t, <-done)
+
+		assert.Equal(t, int32(7200), got.ttl)
+		assert.Equal(t, got.claimed.Add(2*time.Hour), got.deadline)
+	})
+
+	t.Run("NegativeClaimTimeout", func(t *testing.T) {
+		const queue = "run-negative-claim-timeout"
+		enqueueN(t, db, queue, 1)
+
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 1}, nil)
+		r.Threads = 1
+		r.ClaimTimeout = -time.Second
+
+		assert.EqualError(t, r.Run(t.Context(), db), "raptor: claim timeout -1s must not be negative")
+		assert.Zero(t, countClaimed(t, db, queue))
+	})
+
 	t.Run("ClaimsNoMoreThanIdleWorkers", func(t *testing.T) {
 		const queue = "run-claims-idle"
 		const threads = 2
@@ -443,6 +495,106 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 			assert.Empty(t, worker.ids())
 			assert.Equal(t, jobState{Status: "pending", Attempts: 0}, readJobState(t, db, ids[0]))
 		}
+	})
+
+	t.Run("QuietStopsClaimingAndFinishesInFlightJob", func(t *testing.T) {
+		const queue = "run-quiet-in-flight"
+		ids := enqueueN(t, db, queue, 3)
+
+		worker := newBlockingWorker()
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 10}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		started := worker.awaitStart(t)
+		r.Quiet()
+		close(worker.unblock)
+
+		require.Eventually(t, func() bool {
+			return readJobState(t, db, started.ID).Status == "completed"
+		}, 3*time.Second, 10*time.Millisecond, "in-flight job never completed after Quiet")
+
+		select {
+		case job := <-worker.started:
+			t.Fatalf("runner started job %s after Quiet", job.ID)
+		case <-done:
+			t.Fatal("Run returned after Quiet before its context was done")
+		case <-time.After(200 * time.Millisecond):
+		}
+		assert.Zero(t, countClaimed(t, db, queue))
+
+		cancel()
+		require.NoError(t, <-done)
+
+		for _, id := range ids {
+			want := jobState{Status: "pending", Attempts: 0}
+			if id == started.ID {
+				want = jobState{Status: "completed", Attempts: 1}
+			}
+			assert.Equal(t, want, readJobState(t, db, id), "job %s", id)
+		}
+	})
+
+	t.Run("QuietBeforeRunClaimsNothing", func(t *testing.T) {
+		const queue = "run-quiet-before"
+		id := enqueueN(t, db, queue, 1)[0]
+
+		worker := newBlockingWorker()
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 1}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.emptyCooldown = 10 * time.Millisecond
+		r.Quiet()
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		select {
+		case job := <-worker.started:
+			t.Fatalf("quieted runner started job %s", job.ID)
+		case <-done:
+			t.Fatal("Run returned before its context was done")
+		case <-time.After(200 * time.Millisecond):
+		}
+
+		cancel()
+		require.NoError(t, <-done)
+		assert.Equal(t, jobState{Status: "pending", Attempts: 0}, readJobState(t, db, id))
+	})
+
+	t.Run("QuietRacingShutdown", func(t *testing.T) {
+		const queue = "run-quiet-racing"
+		enqueueN(t, db, queue, 4)
+
+		worker := &recordingWorker{}
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 10}, map[string]Worker{"test.job": worker})
+		r.Threads = 2
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		var quieting sync.WaitGroup
+		for range 4 {
+			quieting.Go(r.Quiet)
+		}
+		cancel()
+		quieting.Wait()
+		r.Quiet()
+
+		require.NoError(t, <-done)
+		assert.Zero(t, countClaimed(t, db, queue))
 	})
 
 	t.Run("ParentCancelledWithCause", func(t *testing.T) {

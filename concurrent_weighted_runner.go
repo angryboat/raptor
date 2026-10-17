@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -28,10 +27,16 @@ type ConcurrentWeightedRunner struct {
 	// pending without using an attempt. Zero waits for jobs to finish, up to
 	// their claim deadline. It must not be negative.
 	ShutdownTimeout time.Duration
+	// ClaimTimeout is how long each claim lasts, and so the deadline on each
+	// job's context. Claim rounds it up to whole seconds. Zero keeps the
+	// TTL stored on the job, 5 minutes unless set otherwise. Set it above the
+	// longest job, or Sweep may reap a running job and another worker run it
+	// again. It must not be negative.
+	ClaimTimeout time.Duration
 
 	emptyCooldown time.Duration
 	id            string
-	quiet         atomic.Bool
+	quiet         quietSignal
 }
 
 func NewConcurrentWeightedRunner(queue map[string]int, workers map[string]Worker) *ConcurrentWeightedRunner {
@@ -44,8 +49,16 @@ func NewConcurrentWeightedRunner(queue map[string]int, workers map[string]Worker
 	}
 }
 
+// Quiet stops Run from claiming new jobs. Quiet doesn't wait for Run, so a
+// claim racing Quiet may still take one more batch. Jobs already claimed,
+// including that batch, still run and settle.
+// Run keeps blocking until its context is done, so a process can quiet its
+// runner ahead of shutdown and cancel the context once in-flight jobs finish.
+// Quiet is permanent: a quieted runner never claims again, even from a later
+// Run. It is safe to call more than once, before Run starts, and concurrently
+// with Run.
 func (c *ConcurrentWeightedRunner) Quiet() {
-	c.quiet.Store(true)
+	c.quiet.quiet()
 }
 
 func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
@@ -53,6 +66,9 @@ func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
 		return fmt.Errorf("raptor: runner threads %d must be positive", c.Threads)
 	}
 	if err := validateShutdownTimeout(c.ShutdownTimeout); err != nil {
+		return err
+	}
+	if err := validateClaimTimeout(c.ClaimTimeout); err != nil {
 		return err
 	}
 
@@ -68,7 +84,7 @@ func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
 
 	go func() {
 		defer close(jobs)
-		for ctx.Err() == nil && !c.quiet.Load() {
+		for ctx.Err() == nil && !c.quiet.quieted() {
 			if err := c.dequeue(ctx, db, queues, idle, jobs); err != nil {
 				cancel(err)
 				return
@@ -139,6 +155,7 @@ func (c *ConcurrentWeightedRunner) dequeue(ctx context.Context, db DB, queues []
 	if !claimedAny {
 		select {
 		case <-ctx.Done():
+		case <-c.quiet.done():
 		case <-time.After(c.emptyCooldown):
 		}
 	}
@@ -158,12 +175,16 @@ func (c *ConcurrentWeightedRunner) drainQueue(ctx context.Context, db DB, name s
 			return claimed, err
 		}
 
-		limit := idle.take(ctx, max-claimed)
+		limit := idle.take(ctx, c.quiet.done(), max-claimed)
 		if limit == 0 {
 			return claimed, ctx.Err()
 		}
+		if c.quiet.quieted() {
+			idle.put(limit)
+			return claimed, nil
+		}
 
-		jobs, err := Claim(ctx, db, name, c.id, limit, 0)
+		jobs, err := Claim(ctx, db, name, c.id, limit, c.ClaimTimeout)
 		idle.put(limit - len(jobs))
 		if err != nil {
 			return claimed, err
@@ -194,9 +215,11 @@ func newIdleWorkers(n int) idleWorkers {
 	return idle
 }
 
-func (w idleWorkers) take(ctx context.Context, max int) int {
+func (w idleWorkers) take(ctx context.Context, stop <-chan struct{}, max int) int {
 	select {
 	case <-ctx.Done():
+		return 0
+	case <-stop:
 		return 0
 	case <-w:
 	}
@@ -239,9 +262,41 @@ func (c *ConcurrentWeightedRunner) release(ctx context.Context, db DB, jobs ...*
 
 const settleTimeout = 10 * time.Second
 
+type quietSignal struct {
+	init sync.Once
+	stop sync.Once
+	ch   chan struct{}
+}
+
+func (q *quietSignal) done() <-chan struct{} {
+	q.init.Do(func() { q.ch = make(chan struct{}) })
+	return q.ch
+}
+
+func (q *quietSignal) quiet() {
+	q.done()
+	q.stop.Do(func() { close(q.ch) })
+}
+
+func (q *quietSignal) quieted() bool {
+	select {
+	case <-q.done():
+		return true
+	default:
+		return false
+	}
+}
+
 func validateShutdownTimeout(timeout time.Duration) error {
 	if timeout < 0 {
 		return fmt.Errorf("raptor: shutdown timeout %s must not be negative", timeout)
+	}
+	return nil
+}
+
+func validateClaimTimeout(timeout time.Duration) error {
+	if timeout < 0 {
+		return fmt.Errorf("raptor: claim timeout %s must not be negative", timeout)
 	}
 	return nil
 }
