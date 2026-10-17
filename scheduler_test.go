@@ -498,6 +498,31 @@ func TestScheduler_Run(t *testing.T) {
 		assert.NoError(t, <-done)
 	})
 
+	t.Run("stores a schedule deleted while running and fires it again", func(t *testing.T) {
+		deleted := Schedule{Name: "deleted", Spec: "@every 1s", Job: EnqueueJob{Queue: "default", Type: "test.deleted"}}
+		s := newTestScheduler(t, deleted)
+		s.Interval = time.Hour
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- s.Run(ctx, pool) }()
+
+		require.Eventually(t, func() bool {
+			return countJobs(t, pool, "test.deleted") >= 1
+		}, 3*time.Second, 50*time.Millisecond)
+		_, err := pool.Exec(t.Context(), `DELETE FROM "raptor_schedules" WHERE "name" = 'deleted'`)
+		require.NoError(t, err)
+		fired := countJobs(t, pool, "test.deleted")
+
+		assert.Eventually(t, func() bool {
+			return countJobs(t, pool, "test.deleted") > fired
+		}, 3*time.Second, 50*time.Millisecond)
+		assert.Contains(t, scheduleKeys(t, pool), scheduleKey{"deleted", "@every 1s"})
+
+		cancel()
+		assert.NoError(t, <-done)
+	})
+
 	t.Run("rejects a non-positive Interval", func(t *testing.T) {
 		s := newTestScheduler(t)
 		s.Interval = 0

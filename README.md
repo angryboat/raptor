@@ -130,7 +130,8 @@ A stored schedule is identified by its name and spec, so changing either makes
 a new schedule. During a rolling deploy, old and new replicas each run their
 own version of a changed schedule, so it may fire on both cadences until the
 old replicas stop. Once a schedule is an hour overdue, no replica is running
-it, and the next boot of any replica deletes it.
+it, and the next boot of any replica deletes it. A running replica that still
+defines a deleted schedule stores it again, first due at its next tick.
 
 ## Maintenance
 
