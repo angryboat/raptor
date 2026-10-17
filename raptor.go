@@ -73,6 +73,12 @@ type EnqueueJob struct {
 	ExpiresAt      time.Time
 	MaxAttempts    int32
 	IdempotencyKey string
+	// ClaimTTL is how long a claim on the job lasts before Sweep may reap it
+	// and the worker's context is cancelled, rounded up to whole seconds.
+	// Zero keeps the default of 5 minutes; negative is rejected. A positive
+	// timeout passed to Claim overrides it and replaces it on the job, so
+	// later claims without a timeout, such as retries, keep the override.
+	ClaimTTL time.Duration
 }
 
 type enqueueParams struct {
@@ -84,6 +90,7 @@ type enqueueParams struct {
 	expiresAt      *time.Time
 	maxAttempts    int32
 	idempotencyKey *string
+	claimedTTL     *int32
 }
 
 func newEnqueueParams(job EnqueueJob) (enqueueParams, error) {
@@ -115,6 +122,10 @@ func newEnqueueParams(job EnqueueJob) (enqueueParams, error) {
 	if job.IdempotencyKey != "" {
 		p.idempotencyKey = &job.IdempotencyKey
 	}
+	if job.ClaimTTL > 0 {
+		ttl := ttlSeconds(job.ClaimTTL)
+		p.claimedTTL = &ttl
+	}
 
 	return p, nil
 }
@@ -127,6 +138,8 @@ func validateEnqueueJob(job EnqueueJob) error {
 		return errors.New("job type must be 1-64 characters")
 	case !lengthWithin(job.IdempotencyKey, 0, 128):
 		return errors.New("job idempotency key must be at most 128 characters")
+	case job.ClaimTTL < 0:
+		return errors.New("job claim TTL must not be negative")
 	}
 	return nil
 }
@@ -142,7 +155,7 @@ func Enqueue(ctx context.Context, db DB, job EnqueueJob) (string, error) {
 		return "", fmt.Errorf("raptor: %w", err)
 	}
 
-	rows, err := db.Query(ctx, `SELECT "raptor_enqueue_job"($1, $2, $3, $4, $5, $6, $7, $8)`,
+	rows, err := db.Query(ctx, `SELECT "raptor_enqueue_job"($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		p.queue,
 		p.jobType,
 		p.payload,
@@ -151,6 +164,7 @@ func Enqueue(ctx context.Context, db DB, job EnqueueJob) (string, error) {
 		p.expiresAt,
 		p.maxAttempts,
 		p.idempotencyKey,
+		p.claimedTTL,
 	)
 	if err != nil {
 		return "", enqueueError(err)

@@ -176,6 +176,28 @@ func TestSerialRunner(t *testing.T) {
 		assert.Equal(t, claimed.Add(2*time.Hour), deadline)
 	})
 
+	t.Run("Execute_EnqueuedClaimTTLSetsDeadline", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		_, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", ClaimTTL: 30 * time.Minute})
+		require.NoError(t, err)
+
+		var (
+			deadline time.Time
+			claimed  time.Time
+		)
+		worker := ValueWorkerFunc(func(ctx context.Context, job *Job, _ any) error {
+			deadline, _ = ctx.Deadline()
+			claimed = *job.ClaimedAt
+			return nil
+		})
+		r := NewSerialRunner([]string{"default"}, map[string]Worker{"test.job": worker})
+
+		require.NoError(t, r.Execute(t.Context(), db))
+
+		assert.Equal(t, claimed.Add(30*time.Minute), deadline)
+	})
+
 	t.Run("Execute_NegativeClaimTimeout", func(t *testing.T) {
 		db := beginTx(t, conn)
 

@@ -386,17 +386,17 @@ func (s *Scheduler) Tick(ctx context.Context, db TxDB) (int, error) {
 
 	if _, err := tx.Exec(ctx, `
 		WITH "fired" AS (
-			SELECT * FROM unnest($1::text[], $2::text[], $3::timestamptz[], $4::text[], $5::text[], $6::jsonb[], $7::smallint[], $8::int[], $9::text[])
-				AS f("name", "spec", "next_run_at", "queue", "type", "payload", "priority", "max_attempts", "idempotency_key")
+			SELECT * FROM unnest($1::text[], $2::text[], $3::timestamptz[], $4::text[], $5::text[], $6::jsonb[], $7::smallint[], $8::int[], $9::text[], $10::int[])
+				AS f("name", "spec", "next_run_at", "queue", "type", "payload", "priority", "max_attempts", "idempotency_key", "claimed_ttl")
 		), "advanced" AS (
 			UPDATE "raptor_schedules" s
 			SET "next_run_at" = f."next_run_at", "last_run_at" = now(), "updated_at" = now()
 			FROM "fired" f
 			WHERE s."name" = f."name" AND s."spec" = f."spec"
 		)
-		SELECT "raptor_enqueue_job"(f."queue", f."type", f."payload", f."priority", NULL, NULL, f."max_attempts", f."idempotency_key")
+		SELECT "raptor_enqueue_job"(f."queue", f."type", f."payload", f."priority", NULL, NULL, f."max_attempts", f."idempotency_key", f."claimed_ttl")
 		FROM "fired" f`,
-		f.names, f.specs, f.nextRunAts, f.queues, f.types, f.payloads, f.priorities, f.maxAttempts, f.idempotencyKeys,
+		f.names, f.specs, f.nextRunAts, f.queues, f.types, f.payloads, f.priorities, f.maxAttempts, f.idempotencyKeys, f.claimedTTLs,
 	); err != nil {
 		return 0, err
 	}
@@ -417,6 +417,7 @@ type firings struct {
 	priorities      []int16
 	maxAttempts     []int32
 	idempotencyKeys []*string
+	claimedTTLs     []*int32
 }
 
 func (f *firings) add(p parsedSchedule, next time.Time) {
@@ -429,6 +430,7 @@ func (f *firings) add(p parsedSchedule, next time.Time) {
 	f.priorities = append(f.priorities, p.job.priority)
 	f.maxAttempts = append(f.maxAttempts, p.job.maxAttempts)
 	f.idempotencyKeys = append(f.idempotencyKeys, p.job.idempotencyKey)
+	f.claimedTTLs = append(f.claimedTTLs, p.job.claimedTTL)
 }
 
 // next stays on cadence while on time and jumps past now once behind, so missed ticks collapse into one run.

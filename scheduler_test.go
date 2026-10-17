@@ -49,6 +49,7 @@ func TestNewScheduler(t *testing.T) {
 		"empty type":            {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default"}}},
 		"type too long":         {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default", Type: strings.Repeat("t", 65)}}},
 		"key too long":          {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default", Type: "test.job", IdempotencyKey: strings.Repeat("k", 129)}}},
+		"negative ClaimTTL":     {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default", Type: "test.job", ClaimTTL: -time.Second}}},
 		"VisibleAt set":         {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default", Type: "test.job", VisibleAt: time.Now()}}},
 		"ExpiresAt set":         {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default", Type: "test.job", ExpiresAt: time.Now()}}},
 		"payload won't marshal": {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default", Type: "test.job", Payload: make(chan int)}}},
@@ -197,6 +198,7 @@ func TestScheduler(t *testing.T) {
 			Priority:       5,
 			MaxAttempts:    3,
 			IdempotencyKey: "custom",
+			ClaimTTL:       90 * time.Second,
 		}}
 		s := newTestScheduler(t, plain, custom)
 		require.NoError(t, s.Sync(t.Context(), db))
@@ -208,10 +210,10 @@ func TestScheduler(t *testing.T) {
 		assert.Equal(t, 2, n)
 
 		got := readJob(t, db, "test.plain")
-		assert.Equal(t, scheduledJob{Queue: "default", Payload: json.RawMessage("null"), MaxAttempts: 10}, got)
+		assert.Equal(t, scheduledJob{Queue: "default", Payload: json.RawMessage("null"), MaxAttempts: 10, ClaimedTTL: 300}, got)
 		key := "custom"
 		got = readJob(t, db, "test.custom")
-		assert.Equal(t, scheduledJob{Queue: "other", Payload: json.RawMessage(`{"n": 1}`), Priority: 5, MaxAttempts: 3, IdempotencyKey: &key}, got)
+		assert.Equal(t, scheduledJob{Queue: "other", Payload: json.RawMessage(`{"n": 1}`), Priority: 5, MaxAttempts: 3, IdempotencyKey: &key, ClaimedTTL: 90}, got)
 	})
 
 	t.Run("Tick collapses missed ticks into one job", func(t *testing.T) {
@@ -670,13 +672,14 @@ type scheduledJob struct {
 	Priority       int16
 	MaxAttempts    int32
 	IdempotencyKey *string
+	ClaimedTTL     int32
 }
 
 func readJob(t testing.TB, db DB, jobType string) scheduledJob {
 	t.Helper()
 
 	rows, err := db.Query(t.Context(), `
-		SELECT "queue_name", "job_data", "priority", "max_attempts", "idempotency_key"
+		SELECT "queue_name", "job_data", "priority", "max_attempts", "idempotency_key", "claimed_ttl"
 		FROM "raptor_jobs" WHERE "job_type" = $1`, jobType)
 	require.NoError(t, err)
 
