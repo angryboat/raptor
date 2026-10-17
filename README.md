@@ -72,7 +72,8 @@ the runner to settle jobs after the timeout.
 
 Call `Quiet` to stop a runner claiming new jobs without stopping the ones it
 has, say from a pre-stop hook while the load balancer drains. Jobs already
-claimed run and settle as usual. `Run` keeps blocking until `ctx` is
+claimed run and settle as usual, including one last batch from a claim that
+races `Quiet`. `Run` keeps blocking until `ctx` is
 cancelled, so cancel it once in-flight jobs are done; `SerialRunner.Execute`
 returns nil once its running job settles. Quiet is permanent for that runner,
 and it's safe to call more than once, before `Run` starts, or while it shuts

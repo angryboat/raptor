@@ -43,8 +43,9 @@ func NewConcurrentWeightedRunner(queue map[string]int, workers map[string]Worker
 	}
 }
 
-// Quiet stops Run from claiming new jobs. Jobs already claimed, including
-// those from a claim in progress when Quiet is called, still run and settle.
+// Quiet stops Run from claiming new jobs. Quiet doesn't wait for Run, so a
+// claim racing Quiet may still take one more batch. Jobs already claimed,
+// including that batch, still run and settle.
 // Run keeps blocking until its context is done, so a process can quiet its
 // runner ahead of shutdown and cancel the context once in-flight jobs finish.
 // Quiet is permanent: a quieted runner never claims again, even from a later

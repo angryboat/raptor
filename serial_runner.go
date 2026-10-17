@@ -30,7 +30,8 @@ func NewSerialRunner(queue []string, workers map[string]Worker) *SerialRunner {
 
 // Quiet stops Execute from claiming new jobs. The job already running
 // finishes and settles, then Execute returns nil, as if its queues were empty.
-// Quiet is permanent: a quieted runner never claims again, even from a later
+// Quiet doesn't wait for Execute, so a claim racing Quiet may still take one
+// more job, which runs and settles like any other. Quiet is permanent: a quieted runner never claims again, even from a later
 // Execute. It is safe to call more than once, before Execute starts, and
 // concurrently with Execute.
 func (r *SerialRunner) Quiet() {
