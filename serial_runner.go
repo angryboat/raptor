@@ -43,6 +43,9 @@ func (r *SerialRunner) Quiet() {
 
 // Execute drains each queue in Queue, in slice order: a queue is claimed
 // from repeatedly until empty before the next queue in the slice starts.
+// It returns nil once every queue is empty, once Quiet is called, or once ctx
+// is cancelled, after the running job settles. A ctx that passes its deadline
+// is reported as an error, as is any error claiming a job.
 func (r *SerialRunner) Execute(ctx context.Context, db DB) error {
 	if err := validateShutdownTimeout(r.ShutdownTimeout); err != nil {
 		return err
@@ -56,7 +59,7 @@ func (r *SerialRunner) Execute(ctx context.Context, db DB) error {
 
 	for _, queue := range r.Queue {
 		if err := r.drainQueue(ctx, jobCtx, db, queue); err != nil {
-			return err
+			return shutdownErr(ctx, err)
 		}
 	}
 
