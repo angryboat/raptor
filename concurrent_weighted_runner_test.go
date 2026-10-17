@@ -361,6 +361,57 @@ func TestConcurrentWeightedRunner_Run(t *testing.T) {
 		assert.Zero(t, countClaimed(t, db, queue))
 	})
 
+	t.Run("ClaimTimeoutSetsClaimTTL", func(t *testing.T) {
+		const queue = "run-claim-timeout"
+		enqueueN(t, db, queue, 1)
+
+		type claim struct {
+			ttl      int32
+			deadline time.Time
+			claimed  time.Time
+		}
+		claims := make(chan claim, 1)
+		worker := ValueWorkerFunc(func(ctx context.Context, job *Job, _ any) error {
+			deadline, _ := ctx.Deadline()
+			claims <- claim{ttl: job.ClaimedTTL, deadline: deadline, claimed: *job.ClaimedAt}
+			return nil
+		})
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 1}, map[string]Worker{"test.job": worker})
+		r.Threads = 1
+		r.ClaimTimeout = 2 * time.Hour
+		r.emptyCooldown = 10 * time.Millisecond
+
+		ctx, cancel := context.WithCancel(t.Context())
+		defer cancel()
+
+		done := make(chan error, 1)
+		go func() { done <- r.Run(ctx, db) }()
+
+		var got claim
+		select {
+		case got = <-claims:
+		case <-time.After(3 * time.Second):
+			t.Fatal("worker never ran the job")
+		}
+		cancel()
+		require.NoError(t, <-done)
+
+		assert.Equal(t, int32(7200), got.ttl)
+		assert.Equal(t, got.claimed.Add(2*time.Hour), got.deadline)
+	})
+
+	t.Run("NegativeClaimTimeout", func(t *testing.T) {
+		const queue = "run-negative-claim-timeout"
+		enqueueN(t, db, queue, 1)
+
+		r := NewConcurrentWeightedRunner(map[string]int{queue: 1}, nil)
+		r.Threads = 1
+		r.ClaimTimeout = -time.Second
+
+		assert.EqualError(t, r.Run(t.Context(), db), "raptor: claim timeout -1s must not be negative")
+		assert.Zero(t, countClaimed(t, db, queue))
+	})
+
 	t.Run("ClaimsNoMoreThanIdleWorkers", func(t *testing.T) {
 		const queue = "run-claims-idle"
 		const threads = 2

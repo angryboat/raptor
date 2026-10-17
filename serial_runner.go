@@ -15,6 +15,9 @@ type SerialRunner struct {
 	// once its context is done. It behaves as it does on
 	// ConcurrentWeightedRunner.
 	ShutdownTimeout time.Duration
+	// ClaimTimeout is how long each claim lasts, and so the deadline on each
+	// job's context. It behaves as it does on ConcurrentWeightedRunner.
+	ClaimTimeout time.Duration
 
 	id    string
 	quiet quietSignal
@@ -44,6 +47,9 @@ func (r *SerialRunner) Execute(ctx context.Context, db DB) error {
 	if err := validateShutdownTimeout(r.ShutdownTimeout); err != nil {
 		return err
 	}
+	if err := validateClaimTimeout(r.ClaimTimeout); err != nil {
+		return err
+	}
 
 	jobCtx, stopJobs := shutdownContext(ctx, r.ShutdownTimeout)
 	defer stopJobs()
@@ -66,7 +72,7 @@ func (r *SerialRunner) drainQueue(ctx, jobCtx context.Context, db DB, queue stri
 			return nil
 		}
 
-		jobs, err := Claim(ctx, db, queue, r.id, 1, 0)
+		jobs, err := Claim(ctx, db, queue, r.id, 1, r.ClaimTimeout)
 		if err != nil {
 			return err
 		}

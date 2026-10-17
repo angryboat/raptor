@@ -27,6 +27,12 @@ type ConcurrentWeightedRunner struct {
 	// pending without using an attempt. Zero waits for jobs to finish, up to
 	// their claim deadline. It must not be negative.
 	ShutdownTimeout time.Duration
+	// ClaimTimeout is how long each claim lasts, and so the deadline on each
+	// job's context. Claim rounds it up to whole seconds. Zero keeps the
+	// TTL stored on the job, 5 minutes unless set otherwise. Set it above the
+	// longest job, or Sweep may reap a running job and another worker run it
+	// again. It must not be negative.
+	ClaimTimeout time.Duration
 
 	emptyCooldown time.Duration
 	id            string
@@ -60,6 +66,9 @@ func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
 		return fmt.Errorf("raptor: runner threads %d must be positive", c.Threads)
 	}
 	if err := validateShutdownTimeout(c.ShutdownTimeout); err != nil {
+		return err
+	}
+	if err := validateClaimTimeout(c.ClaimTimeout); err != nil {
 		return err
 	}
 
@@ -175,7 +184,7 @@ func (c *ConcurrentWeightedRunner) drainQueue(ctx context.Context, db DB, name s
 			return claimed, nil
 		}
 
-		jobs, err := Claim(ctx, db, name, c.id, limit, 0)
+		jobs, err := Claim(ctx, db, name, c.id, limit, c.ClaimTimeout)
 		idle.put(limit - len(jobs))
 		if err != nil {
 			return claimed, err
@@ -281,6 +290,13 @@ func (q *quietSignal) quieted() bool {
 func validateShutdownTimeout(timeout time.Duration) error {
 	if timeout < 0 {
 		return fmt.Errorf("raptor: shutdown timeout %s must not be negative", timeout)
+	}
+	return nil
+}
+
+func validateClaimTimeout(timeout time.Duration) error {
+	if timeout < 0 {
+		return fmt.Errorf("raptor: claim timeout %s must not be negative", timeout)
 	}
 	return nil
 }

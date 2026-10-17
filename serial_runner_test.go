@@ -151,6 +151,43 @@ func TestSerialRunner(t *testing.T) {
 		assert.Equal(t, claimEnds, deadline)
 	})
 
+	t.Run("Execute_ClaimTimeoutSetsClaimTTL", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		enqueueN(t, db, "default", 1)
+
+		var (
+			ttl      int32
+			deadline time.Time
+			claimed  time.Time
+		)
+		worker := ValueWorkerFunc(func(ctx context.Context, job *Job, _ any) error {
+			ttl = job.ClaimedTTL
+			deadline, _ = ctx.Deadline()
+			claimed = *job.ClaimedAt
+			return nil
+		})
+		r := NewSerialRunner([]string{"default"}, map[string]Worker{"test.job": worker})
+		r.ClaimTimeout = 2 * time.Hour
+
+		require.NoError(t, r.Execute(t.Context(), db))
+
+		assert.Equal(t, int32(7200), ttl)
+		assert.Equal(t, claimed.Add(2*time.Hour), deadline)
+	})
+
+	t.Run("Execute_NegativeClaimTimeout", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		enqueueN(t, db, "default", 1)
+
+		r := NewSerialRunner([]string{"default"}, nil)
+		r.ClaimTimeout = -time.Second
+
+		assert.EqualError(t, r.Execute(t.Context(), db), "raptor: claim timeout -1s must not be negative")
+		assert.Zero(t, countClaimed(t, db, "default"))
+	})
+
 	t.Run("Execute_CancelWaitsForRunningJob", func(t *testing.T) {
 		db := beginTx(t, conn)
 
