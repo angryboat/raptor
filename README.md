@@ -122,13 +122,16 @@ return scheduler.Run(ctx, pool)
 
 Specs are cron expressions, descriptors like `@daily`, or `@every <duration>`
 with a whole number of seconds, in UTC unless prefixed with `CRON_TZ=`. `Run` wakes when a schedule is due and
-otherwise checks every `Interval` (one minute by default).
+otherwise checks every `Interval` (one minute by default). A replica that loses
+a tick to another checks again a moment later, so it takes over if the winner
+stops.
 
 A stored schedule is identified by its name and spec, so changing either makes
 a new schedule. During a rolling deploy, old and new replicas each run their
 own version of a changed schedule, so it may fire on both cadences until the
 old replicas stop. Once a schedule is an hour overdue, no replica is running
-it, and the next boot of any replica deletes it.
+it, and the next boot of any replica deletes it. A running replica that still
+defines a deleted schedule stores it again, first due at its next tick.
 
 ## Maintenance
 

@@ -58,12 +58,15 @@ type Schedule struct {
 // A stored schedule more than an hour overdue is abandoned: no running
 // Scheduler defines it. Sync deletes abandoned schedules it doesn't define,
 // so a schedule removed from code is deleted by a Sync after its last due
-// time.
+// time. A running Scheduler whose schedule is deleted anyway stores it again at
+// its next check.
 type Scheduler struct {
 	// Interval is the longest Run waits between checks for due schedules. Run
 	// wakes when the next schedule is due, so Interval only bounds how long it
 	// takes to notice a schedule another process stored or failed to enqueue.
-	// It defaults to one minute.
+	// When another Scheduler holds a due schedule, Run checks again after a
+	// short backoff, and waits Interval only if it stays held for about a
+	// second. It defaults to one minute.
 	Interval time.Duration
 
 	schedules map[string]parsedSchedule
@@ -190,7 +193,9 @@ func validateScheduledJob(job EnqueueJob) error {
 }
 
 // Run calls Sync, then calls Tick whenever a schedule is due, checking at
-// least every Interval, until ctx is cancelled. It returns nil once ctx is
+// least every Interval, until ctx is cancelled. Whenever a check finds a
+// schedule s defines missing from the database, Run calls Sync again to store
+// it, first due at its next tick after now. It returns nil once ctx is
 // cancelled. Any other error from Sync or Tick, including a transient
 // database error, stops Run and is returned, so callers that need the
 // scheduler to keep running should restart it.
@@ -228,46 +233,73 @@ func shutdownErr(ctx context.Context, err error) error {
 	return err
 }
 
+const (
+	lostTickBackoff = 250 * time.Millisecond
+	lostTickRetries = 4
+)
+
 func (s *Scheduler) poll(ctx context.Context, db TxDB) (time.Duration, error) {
-	wait, err := s.untilDue(ctx, db)
-	if err != nil || wait > 0 {
+	for attempt := 0; ; attempt++ {
+		wait, err := s.syncedUntilDue(ctx, db)
+		if err != nil || wait > 0 {
+			return wait, err
+		}
+
+		n, err := s.Tick(ctx, db)
+		if err != nil || n > 0 {
+			return 0, err
+		}
+		if attempt == lostTickRetries {
+			return s.Interval, nil
+		}
+
+		// Another Scheduler holds or just advanced the due row; look again once it commits.
+		select {
+		case <-ctx.Done():
+			return 0, ctx.Err()
+		case <-time.After(lostTickBackoff):
+		}
+	}
+}
+
+func (s *Scheduler) syncedUntilDue(ctx context.Context, db TxDB) (time.Duration, error) {
+	wait, stored, err := s.untilDue(ctx, db)
+	if err != nil || stored == len(s.names) {
 		return wait, err
 	}
 
-	n, err := s.Tick(ctx, db)
-	if err != nil {
+	if err := s.Sync(ctx, db); err != nil {
 		return 0, err
 	}
-	if n == 0 {
-		return s.Interval, nil
-	}
-	return 0, nil
+	wait, _, err = s.untilDue(ctx, db)
+	return wait, err
 }
 
 type earliestDue struct {
-	At  *time.Time
-	Now time.Time
+	At     *time.Time
+	Stored int
+	Now    time.Time
 }
 
-func (s *Scheduler) untilDue(ctx context.Context, db DB) (time.Duration, error) {
+func (s *Scheduler) untilDue(ctx context.Context, db DB) (time.Duration, int, error) {
 	rows, err := db.Query(ctx, `
-		SELECT min(s."next_run_at"), now()
+		SELECT min(s."next_run_at"), count(*), now()
 		FROM "raptor_schedules" s
 		JOIN unnest($1::text[], $2::text[]) AS k("name", "spec") ON k."name" = s."name" AND k."spec" = s."spec"`,
 		s.names, s.specs,
 	)
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 	due, err := pgx.CollectExactlyOneRow(rows, pgx.RowToStructByPos[earliestDue])
 	if err != nil {
-		return 0, err
+		return 0, 0, err
 	}
 
 	if due.At == nil {
-		return s.Interval, nil
+		return s.Interval, due.Stored, nil
 	}
-	return due.At.Sub(due.Now), nil
+	return due.At.Sub(due.Now), due.Stored, nil
 }
 
 // Sync stores each of s's schedules that the database doesn't have yet, first

@@ -420,6 +420,109 @@ func TestScheduler_Run(t *testing.T) {
 		assert.LessOrEqual(t, countJobs(t, pool, "test.fast"), int(elapsed.Seconds())+1)
 	})
 
+	t.Run("takes over the next tick from a replica that won a race and stopped", func(t *testing.T) {
+		race := Schedule{Name: "race", Spec: "@every 1s", Job: EnqueueJob{Queue: "default", Type: "test.race"}}
+		winner, loser := newTestScheduler(t, race), newTestScheduler(t, race)
+		loser.Interval = time.Hour
+		require.NoError(t, winner.Sync(t.Context(), pool))
+		setNextRunAt(t, pool, race, "now() - interval '1 second'")
+
+		atFirstTick, startFirstTick := make(chan struct{}), make(chan struct{})
+		lost := make(chan struct{}, 16)
+		loserDB := &hookedDB{
+			TxDB: pool,
+			onBegin: func(n int32) {
+				if n == 2 {
+					close(atFirstTick)
+					<-startFirstTick
+				}
+			},
+			onRollback: func() { lost <- struct{}{} },
+		}
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- loser.Run(ctx, loserDB) }()
+		<-atFirstTick
+
+		holding, release := make(chan struct{}), make(chan struct{})
+		winnerDB := &hookedDB{TxDB: pool, onCommit: func() {
+			close(holding)
+			<-release
+		}}
+		won := make(chan error, 1)
+		go func() {
+			_, err := winner.Tick(t.Context(), winnerDB)
+			won <- err
+		}()
+		<-holding
+		close(startFirstTick)
+		<-lost
+		close(release)
+		require.NoError(t, <-won)
+		require.Equal(t, 1, countJobs(t, pool, "test.race"))
+
+		assert.Eventually(t, func() bool {
+			return countJobs(t, pool, "test.race") >= 2
+		}, 3*time.Second, 50*time.Millisecond)
+
+		cancel()
+		assert.NoError(t, <-done)
+	})
+
+	t.Run("waits Interval once a due schedule stays locked", func(t *testing.T) {
+		stuck := Schedule{Name: "stuck", Spec: "@every 1s", Job: EnqueueJob{Queue: "default", Type: "test.stuck"}}
+		s := newTestScheduler(t, stuck)
+		s.Interval = time.Hour
+		require.NoError(t, s.Sync(t.Context(), pool))
+		setNextRunAt(t, pool, stuck, "now() - interval '1 second'")
+
+		holder, err := pool.Begin(t.Context())
+		require.NoError(t, err)
+		defer holder.Rollback(context.Background())
+		_, err = holder.Exec(t.Context(), `SELECT 1 FROM "raptor_schedules" WHERE "name" = 'stuck' FOR UPDATE`)
+		require.NoError(t, err)
+
+		var lost atomic.Int32
+		db := &hookedDB{TxDB: pool, onRollback: func() { lost.Add(1) }}
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- s.Run(ctx, db) }()
+
+		require.Eventually(t, func() bool {
+			return lost.Load() == lostTickRetries+1
+		}, 3*time.Second, 10*time.Millisecond)
+		time.Sleep(3 * lostTickBackoff)
+		assert.Equal(t, int32(lostTickRetries+1), lost.Load())
+
+		cancel()
+		assert.NoError(t, <-done)
+	})
+
+	t.Run("stores a schedule deleted while running and fires it again", func(t *testing.T) {
+		deleted := Schedule{Name: "deleted", Spec: "@every 1s", Job: EnqueueJob{Queue: "default", Type: "test.deleted"}}
+		s := newTestScheduler(t, deleted)
+		s.Interval = time.Hour
+
+		ctx, cancel := context.WithCancel(t.Context())
+		done := make(chan error, 1)
+		go func() { done <- s.Run(ctx, pool) }()
+
+		require.Eventually(t, func() bool {
+			return countJobs(t, pool, "test.deleted") >= 1
+		}, 3*time.Second, 50*time.Millisecond)
+		_, err := pool.Exec(t.Context(), `DELETE FROM "raptor_schedules" WHERE "name" = 'deleted'`)
+		require.NoError(t, err)
+		fired := countJobs(t, pool, "test.deleted")
+
+		assert.Eventually(t, func() bool {
+			return countJobs(t, pool, "test.deleted") > fired
+		}, 3*time.Second, 50*time.Millisecond)
+		assert.Contains(t, scheduleKeys(t, pool), scheduleKey{"deleted", "@every 1s"})
+
+		cancel()
+		assert.NoError(t, <-done)
+	})
+
 	t.Run("rejects a non-positive Interval", func(t *testing.T) {
 		s := newTestScheduler(t)
 		s.Interval = 0
@@ -455,6 +558,46 @@ func (f *failingBegin) Begin(ctx context.Context) (pgx.Tx, error) {
 		return nil, errBeginFailed
 	}
 	return f.TxDB.Begin(ctx)
+}
+
+type hookedDB struct {
+	TxDB
+	begins     atomic.Int32
+	onBegin    func(int32)
+	onCommit   func()
+	onRollback func()
+}
+
+func (h *hookedDB) Begin(ctx context.Context) (pgx.Tx, error) {
+	if n := h.begins.Add(1); h.onBegin != nil {
+		h.onBegin(n)
+	}
+	tx, err := h.TxDB.Begin(ctx)
+	if err != nil {
+		return nil, err
+	}
+	return &hookedTx{Tx: tx, db: h}, nil
+}
+
+type hookedTx struct {
+	pgx.Tx
+	db        *hookedDB
+	committed bool
+}
+
+func (t *hookedTx) Commit(ctx context.Context) error {
+	if t.db.onCommit != nil {
+		t.db.onCommit()
+	}
+	t.committed = true
+	return t.Tx.Commit(ctx)
+}
+
+func (t *hookedTx) Rollback(ctx context.Context) error {
+	if !t.committed && t.db.onRollback != nil {
+		t.db.onRollback()
+	}
+	return t.Tx.Rollback(ctx)
 }
 
 func newTestScheduler(t testing.TB, schedules ...Schedule) *Scheduler {
