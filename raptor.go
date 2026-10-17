@@ -381,24 +381,39 @@ func Sweep(ctx context.Context, db DB, queue string) error {
 	return rows.Err()
 }
 
+const cleanupBatchSize = 10000
+
+// Cleanup deletes jobs past their retention in batches of at most 10,000 rows,
+// one statement per batch, then rolls up stats. Given a pool, each batch
+// commits on its own; given a transaction, every batch shares it.
 func Cleanup(ctx context.Context, db DB, queue string) error {
+	return cleanup(ctx, db, queue, cleanupBatchSize)
+}
+
+func cleanup(ctx context.Context, db DB, queue string, batchSize int32) error {
 	var q any
 	if queue != "" {
 		q = queue
 	}
 
-	rows, err := db.Query(ctx, `SELECT "raptor_cleanup_jobs"($1), "raptor_rollup_stats"()`, q)
-	if err != nil {
-		return err
-	}
-	defer rows.Close()
-
-	if rows.Next() {
-		var deleted, rolledUp int32
-		if err := rows.Scan(&deleted, &rolledUp); err != nil {
+	for {
+		rows, err := db.Query(ctx, `SELECT "raptor_cleanup_jobs"($1, p_limit => $2)`, q, batchSize)
+		if err != nil {
 			return err
+		}
+		deleted, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[int32])
+		if err != nil {
+			return err
+		}
+		if deleted < batchSize {
+			break
 		}
 	}
 
-	return rows.Err()
+	rows, err := db.Query(ctx, `SELECT "raptor_rollup_stats"()`)
+	if err != nil {
+		return err
+	}
+	_, err = pgx.CollectExactlyOneRow(rows, pgx.RowTo[int32])
+	return err
 }

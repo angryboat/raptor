@@ -907,6 +907,86 @@ func TestRaptor(t *testing.T) {
 		assert.ElementsMatch(t, []string{recent}, remaining())
 	})
 
+	t.Run("Cleanup_Batches", func(t *testing.T) {
+		seedExpired := func(t testing.TB, db pgx.Tx) []string {
+			rows, err := db.Query(t.Context(), `
+				INSERT INTO "raptor_jobs" ("queue_name", "job_type", "status", "completed_at")
+				VALUES ('batch', 'test.job', 'pending', NULL), ('batch', 'test.job', 'completed', now())
+				RETURNING "id"::text`)
+			require.NoError(t, err)
+			kept, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			require.NoError(t, err)
+
+			_, err = db.Exec(t.Context(), `
+				INSERT INTO "raptor_jobs" ("queue_name", "job_type", "status", "completed_at", "cancelled_at")
+				VALUES
+					('batch', 'test.job', 'completed', now() - interval '25 hours', NULL),
+					('batch', 'test.job', 'completed', now() - interval '25 hours', NULL),
+					('batch', 'test.job', 'completed', now() - interval '25 hours', NULL),
+					('batch', 'test.job', 'cancelled', NULL, now() - interval '3 hours'),
+					('batch', 'test.job', 'cancelled', NULL, now() - interval '3 hours')`)
+			require.NoError(t, err)
+
+			_, err = db.Exec(t.Context(), `
+				INSERT INTO "raptor_dead_jobs" ("queue_name", "job_type", "status", "failed_at")
+				SELECT 'batch', 'test.job', 'failed', now() - interval '31 days' FROM generate_series(1, 2)`)
+			require.NoError(t, err)
+			return kept
+		}
+		remaining := func(t testing.TB, db pgx.Tx) int {
+			rows, err := db.Query(t.Context(), `
+				SELECT (SELECT count(*) FROM "raptor_jobs" WHERE "queue_name" = 'batch')
+					+ (SELECT count(*) FROM "raptor_dead_jobs" WHERE "queue_name" = 'batch')`)
+			require.NoError(t, err)
+			n, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[int])
+			require.NoError(t, err)
+			return n
+		}
+
+		t.Run("DeletesEveryBatch", func(t *testing.T) {
+			db := beginTx(t, conn)
+			kept := seedExpired(t, db)
+
+			require.NoError(t, cleanup(t.Context(), db, "batch", 2))
+
+			rows, err := db.Query(t.Context(), `SELECT "id"::text FROM "raptor_jobs" WHERE "queue_name" = 'batch'`)
+			require.NoError(t, err)
+			ids, err := pgx.CollectRows(rows, pgx.RowTo[string])
+			require.NoError(t, err)
+			assert.ElementsMatch(t, kept, ids)
+			assert.Equal(t, len(kept), remaining(t, db))
+		})
+
+		t.Run("CallDeletesAtMostTheLimit", func(t *testing.T) {
+			db := beginTx(t, conn)
+			kept := seedExpired(t, db)
+
+			var deleted []int32
+			for {
+				rows, err := db.Query(t.Context(), `SELECT "raptor_cleanup_jobs"('batch', p_limit => 2)`)
+				require.NoError(t, err)
+				n, err := pgx.CollectExactlyOneRow(rows, pgx.RowTo[int32])
+				require.NoError(t, err)
+				deleted = append(deleted, n)
+				if n < 2 {
+					break
+				}
+			}
+
+			assert.Equal(t, []int32{2, 2, 2, 1}, deleted)
+			assert.Equal(t, len(kept), remaining(t, db))
+		})
+
+		t.Run("RejectsNonPositiveLimit", func(t *testing.T) {
+			db := beginTx(t, conn)
+
+			rows, err := db.Query(t.Context(), `SELECT "raptor_cleanup_jobs"(p_limit => 0)`)
+			require.NoError(t, err)
+			_, err = pgx.CollectExactlyOneRow(rows, pgx.RowTo[int32])
+			assert.ErrorContains(t, err, "raptor: cleanup limit must be positive")
+		})
+	})
+
 	t.Run("Enqueue_Idempotent", func(t *testing.T) {
 		db := beginTx(t, conn)
 

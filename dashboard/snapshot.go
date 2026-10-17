@@ -112,29 +112,49 @@ type deadJob struct {
 }
 
 const totalsQuery = `
-	SELECT p."label",
-		coalesce(sum(s."total_jobs"), 0)::bigint, coalesce(sum(s."total_completed"), 0)::bigint,
-		coalesce(sum(s."total_failed"), 0)::bigint, coalesce(sum(s."total_cancelled"), 0)::bigint,
-		coalesce(sum(s."total_dead"), 0)::bigint
-	FROM (VALUES
-		(1, 'Today', (now() AT TIME ZONE 'UTC')::date),
-		(2, 'This week', date_trunc('week', now() AT TIME ZONE 'UTC')::date),
-		(3, 'This month', date_trunc('month', now() AT TIME ZONE 'UTC')::date),
-		(4, 'All time', NULL)
-	) AS p("ord", "label", "since")
-	LEFT JOIN (
-		SELECT "span"::text AS "source", "date", "total_jobs", "total_completed", "total_failed", "total_cancelled", "total_dead"
-		FROM "raptor_stats"
-		WHERE "span" IN ('day', 'all_time')
-		UNION ALL
-		SELECT 'event', "date", "total_jobs", "total_completed", "total_failed", "total_cancelled", "total_dead"
+	WITH "events" AS (
+		SELECT "date",
+			sum("total_jobs") AS "total_jobs", sum("total_completed") AS "total_completed",
+			sum("total_failed") AS "total_failed", sum("total_cancelled") AS "total_cancelled",
+			sum("total_dead") AS "total_dead"
 		FROM "raptor_stat_events"
-	) s ON CASE
-		WHEN p."since" IS NULL THEN s."source" <> 'day'
-		ELSE s."source" <> 'all_time' AND s."date" >= p."since"
-	END
-	GROUP BY p."ord", p."label"
-	ORDER BY p."ord"`
+		GROUP BY "date"
+	), "days" AS (
+		SELECT "date", "total_jobs", "total_completed", "total_failed", "total_cancelled", "total_dead"
+		FROM "raptor_stats"
+		WHERE "span" = 'day'
+		UNION ALL
+		SELECT "date", "total_jobs", "total_completed", "total_failed", "total_cancelled", "total_dead"
+		FROM "events"
+	), "all_time" AS (
+		SELECT "total_jobs", "total_completed", "total_failed", "total_cancelled", "total_dead"
+		FROM "raptor_stats"
+		WHERE "span" = 'all_time'
+		UNION ALL
+		SELECT "total_jobs", "total_completed", "total_failed", "total_cancelled", "total_dead"
+		FROM "events"
+	)
+	SELECT "label", "total_jobs", "total_completed", "total_failed", "total_cancelled", "total_dead"
+	FROM (
+		SELECT p."ord", p."label",
+			coalesce(sum(d."total_jobs"), 0)::bigint AS "total_jobs", coalesce(sum(d."total_completed"), 0)::bigint AS "total_completed",
+			coalesce(sum(d."total_failed"), 0)::bigint AS "total_failed", coalesce(sum(d."total_cancelled"), 0)::bigint AS "total_cancelled",
+			coalesce(sum(d."total_dead"), 0)::bigint AS "total_dead"
+		FROM (VALUES
+			(1, 'Today', (now() AT TIME ZONE 'UTC')::date),
+			(2, 'This week', date_trunc('week', now() AT TIME ZONE 'UTC')::date),
+			(3, 'This month', date_trunc('month', now() AT TIME ZONE 'UTC')::date)
+		) AS p("ord", "label", "since")
+		LEFT JOIN "days" d ON d."date" >= p."since"
+		GROUP BY p."ord", p."label"
+		UNION ALL
+		SELECT 4, 'All time',
+			coalesce(sum("total_jobs"), 0)::bigint, coalesce(sum("total_completed"), 0)::bigint,
+			coalesce(sum("total_failed"), 0)::bigint, coalesce(sum("total_cancelled"), 0)::bigint,
+			coalesce(sum("total_dead"), 0)::bigint
+		FROM "all_time"
+	) t
+	ORDER BY "ord"`
 
 const queuesQuery = `
 	SELECT q."name",
