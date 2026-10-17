@@ -40,7 +40,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: "1.26"
       - run: go vet ./...
   code-formatting:
     runs-on: ubuntu-latest
@@ -48,7 +48,7 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
+          go-version: "1.26"
       - name: Check Formatting
         run: |-
           unformatted="$(gofmt -s -l .)"
@@ -63,6 +63,6 @@ jobs:
       - uses: actions/checkout@v7
       - uses: actions/setup-go@v7
         with:
-          go-version-file: go.mod
-      - run: go install go.uber.org/nilaway/cmd/nilaway@latest
+          go-version: "1.26"
+      - run: go install go.uber.org/nilaway/cmd/nilaway@v0.0.0-20260918162853-acb8859b9031
       - run: nilaway ./...
