@@ -141,7 +141,10 @@ Call these on a timer, or from a scheduled job:
   `ExpiresAt` has passed.
 - `Cleanup` deletes completed jobs after 24 hours, cancelled jobs after 2
   hours and dead jobs after 30 days, and rolls up stats. Per-type dead counts
-  in `LoadQueueStat` are kept.
+  in `LoadQueueStat` are kept. It deletes at most 10,000 rows per statement
+  and repeats until none are left, so given a pool, a backlog commits in
+  small transactions rather than one large one. Given a transaction, every
+  batch shares it.
 
 `LoadQueueStat` reports completed, failed, cancelled and dead counts for each
 job type in a queue. Each state change records its counts as a new row rather
