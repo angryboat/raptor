@@ -19,12 +19,12 @@ import (
 func TestNewScheduler(t *testing.T) {
 	t.Run("valid", func(t *testing.T) {
 		s, err := NewScheduler(
-			Schedule{Name: "b", Spec: "@every 5m"},
-			Schedule{Name: "a", Spec: "*/15 * * * *"},
-			Schedule{Name: "c", Spec: "CRON_TZ=America/Denver 0 9 * * 1-5"},
-			Schedule{Name: strings.Repeat("é", 128), Spec: "@hourly"},
-			Schedule{Name: "d", Spec: "@every 1s"},
-			Schedule{Name: "e", Spec: "TZ=UTC @every 90s"},
+			Schedule{Name: "b", Spec: "@every 5m", Job: testJob},
+			Schedule{Name: "a", Spec: "*/15 * * * *", Job: testJob},
+			Schedule{Name: "c", Spec: "CRON_TZ=America/Denver 0 9 * * 1-5", Job: testJob},
+			Schedule{Name: strings.Repeat("é", 128), Spec: "@hourly", Job: testJob},
+			Schedule{Name: "d", Spec: "@every 1s", Job: testJob},
+			Schedule{Name: "e", Spec: "TZ=UTC @every 90s", Job: testJob},
 		)
 		require.NoError(t, err)
 		assert.Equal(t, []string{"a", "b", "c", "d", "e", strings.Repeat("é", 128)}, s.names)
@@ -44,12 +44,15 @@ func TestNewScheduler(t *testing.T) {
 		"sub-second interval":   {{Name: "a", Spec: "@every 500ms"}},
 		"fractional interval":   {{Name: "a", Spec: "@every 1500ms"}},
 		"zoned zero interval":   {{Name: "a", Spec: "CRON_TZ=UTC @every 0s"}},
-		"queue too long":        {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: strings.Repeat("q", 65)}}},
-		"type too long":         {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Type: strings.Repeat("t", 65)}}},
-		"key too long":          {{Name: "a", Spec: "@hourly", Job: EnqueueJob{IdempotencyKey: strings.Repeat("k", 129)}}},
-		"VisibleAt set":         {{Name: "a", Spec: "@hourly", Job: EnqueueJob{VisibleAt: time.Now()}}},
-		"ExpiresAt set":         {{Name: "a", Spec: "@hourly", Job: EnqueueJob{ExpiresAt: time.Now()}}},
-		"payload won't marshal": {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Payload: make(chan int)}}},
+		"empty queue":           {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Type: "test.job"}}},
+		"queue too long":        {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: strings.Repeat("q", 65), Type: "test.job"}}},
+		"empty type":            {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default"}}},
+		"type too long":         {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default", Type: strings.Repeat("t", 65)}}},
+		"key too long":          {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default", Type: "test.job", IdempotencyKey: strings.Repeat("k", 129)}}},
+		"negative ClaimTTL":     {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default", Type: "test.job", ClaimTTL: -time.Second}}},
+		"VisibleAt set":         {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default", Type: "test.job", VisibleAt: time.Now()}}},
+		"ExpiresAt set":         {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default", Type: "test.job", ExpiresAt: time.Now()}}},
+		"payload won't marshal": {{Name: "a", Spec: "@hourly", Job: EnqueueJob{Queue: "default", Type: "test.job", Payload: make(chan int)}}},
 	} {
 		t.Run(name, func(t *testing.T) {
 			_, err := NewScheduler(schedules...)
@@ -102,9 +105,9 @@ func TestScheduler(t *testing.T) {
 
 	t.Run("Sync deletes abandoned schedules it doesn't define", func(t *testing.T) {
 		db := beginTx(t, conn)
-		abandoned := Schedule{Name: "abandoned", Spec: "@daily"}
-		overdue := Schedule{Name: "overdue", Spec: "@daily"}
-		upcoming := Schedule{Name: "upcoming", Spec: "@daily"}
+		abandoned := Schedule{Name: "abandoned", Spec: "@daily", Job: testJob}
+		overdue := Schedule{Name: "overdue", Spec: "@daily", Job: testJob}
+		upcoming := Schedule{Name: "upcoming", Spec: "@daily", Job: testJob}
 		require.NoError(t, newTestScheduler(t, hourly, abandoned, overdue, upcoming).Sync(t.Context(), db))
 		setNextRunAt(t, db, hourly, "now() - interval '2 hours'")
 		setNextRunAt(t, db, abandoned, "now() - interval '61 minutes'")
@@ -195,6 +198,7 @@ func TestScheduler(t *testing.T) {
 			Priority:       5,
 			MaxAttempts:    3,
 			IdempotencyKey: "custom",
+			ClaimTTL:       90 * time.Second,
 		}}
 		s := newTestScheduler(t, plain, custom)
 		require.NoError(t, s.Sync(t.Context(), db))
@@ -206,10 +210,10 @@ func TestScheduler(t *testing.T) {
 		assert.Equal(t, 2, n)
 
 		got := readJob(t, db, "test.plain")
-		assert.Equal(t, scheduledJob{Queue: "default", Payload: json.RawMessage("null"), MaxAttempts: 10}, got)
+		assert.Equal(t, scheduledJob{Queue: "default", Payload: json.RawMessage("null"), MaxAttempts: 10, ClaimedTTL: 300}, got)
 		key := "custom"
 		got = readJob(t, db, "test.custom")
-		assert.Equal(t, scheduledJob{Queue: "other", Payload: json.RawMessage(`{"n": 1}`), Priority: 5, MaxAttempts: 3, IdempotencyKey: &key}, got)
+		assert.Equal(t, scheduledJob{Queue: "other", Payload: json.RawMessage(`{"n": 1}`), Priority: 5, MaxAttempts: 3, IdempotencyKey: &key, ClaimedTTL: 90}, got)
 	})
 
 	t.Run("Tick collapses missed ticks into one job", func(t *testing.T) {
@@ -232,7 +236,7 @@ func TestScheduler(t *testing.T) {
 		db := beginTx(t, conn)
 		changed := hourly
 		changed.Spec = "@every 2h"
-		unknown := Schedule{Name: "unknown", Spec: "@hourly"}
+		unknown := Schedule{Name: "unknown", Spec: "@hourly", Job: testJob}
 		require.NoError(t, newTestScheduler(t, changed, unknown).Sync(t.Context(), db))
 		setNextRunAt(t, db, changed, "now() - interval '1 second'")
 		setNextRunAt(t, db, unknown, "now() - interval '1 second'")
@@ -339,8 +343,8 @@ func TestScheduler_ConcurrentSync(t *testing.T) {
 		replicas := make([]*Scheduler, 8)
 		for i := range replicas {
 			replicas[i] = newTestScheduler(t,
-				Schedule{Name: "shared", Spec: "@hourly"},
-				Schedule{Name: "versioned", Spec: []string{"@hourly", "@daily"}[i%2]},
+				Schedule{Name: "shared", Spec: "@hourly", Job: testJob},
+				Schedule{Name: "versioned", Spec: []string{"@hourly", "@daily"}[i%2], Job: testJob},
 			)
 		}
 
@@ -363,8 +367,8 @@ func TestScheduler_ConcurrentSync(t *testing.T) {
 	})
 
 	t.Run("a Sync deleting a schedule another Sync revives", func(t *testing.T) {
-		added := Schedule{Name: "a", Spec: "@hourly"}
-		revived := Schedule{Name: "b", Spec: "@hourly"}
+		added := Schedule{Name: "a", Spec: "@hourly", Job: testJob}
+		revived := Schedule{Name: "b", Spec: "@hourly", Job: testJob}
 		require.NoError(t, newTestScheduler(t, revived).Sync(t.Context(), pool))
 		setNextRunAt(t, pool, revived, "now() - interval '2 hours'")
 
@@ -535,7 +539,7 @@ func TestScheduler_Run(t *testing.T) {
 	})
 
 	t.Run("returns a Tick error", func(t *testing.T) {
-		s := newTestScheduler(t, Schedule{Name: "failing", Spec: "@every 1s"})
+		s := newTestScheduler(t, Schedule{Name: "failing", Spec: "@every 1s", Job: testJob})
 		s.Interval = time.Hour
 		db := &failingBegin{TxDB: pool}
 		db.allowed.Store(1)
@@ -599,6 +603,8 @@ func (t *hookedTx) Rollback(ctx context.Context) error {
 	}
 	return t.Tx.Rollback(ctx)
 }
+
+var testJob = EnqueueJob{Queue: "default", Type: "test.job"}
 
 func newTestScheduler(t testing.TB, schedules ...Schedule) *Scheduler {
 	t.Helper()
@@ -666,13 +672,14 @@ type scheduledJob struct {
 	Priority       int16
 	MaxAttempts    int32
 	IdempotencyKey *string
+	ClaimedTTL     int32
 }
 
 func readJob(t testing.TB, db DB, jobType string) scheduledJob {
 	t.Helper()
 
 	rows, err := db.Query(t.Context(), `
-		SELECT "queue_name", "job_data", "priority", "max_attempts", "idempotency_key"
+		SELECT "queue_name", "job_data", "priority", "max_attempts", "idempotency_key", "claimed_ttl"
 		FROM "raptor_jobs" WHERE "job_type" = $1`, jobType)
 	require.NoError(t, err)
 

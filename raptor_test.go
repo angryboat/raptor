@@ -66,6 +66,41 @@ func TestRaptor(t *testing.T) {
 		assert.NotEmpty(t, id)
 	})
 
+	t.Run("Enqueue_LengthLimits", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{
+			Queue:          strings.Repeat("q", 64),
+			Type:           strings.Repeat("é", 64),
+			IdempotencyKey: strings.Repeat("é", 128),
+		})
+		require.NoError(t, err)
+		assert.NotEmpty(t, id)
+	})
+
+	for name, tc := range map[string]struct {
+		job  EnqueueJob
+		want string
+	}{
+		"empty queue":    {EnqueueJob{Type: "test.job"}, "raptor: job queue must be 1-64 characters"},
+		"queue too long": {EnqueueJob{Queue: strings.Repeat("q", 65), Type: "test.job"}, "raptor: job queue must be 1-64 characters"},
+		"empty type":     {EnqueueJob{Queue: "default"}, "raptor: job type must be 1-64 characters"},
+		"type too long":  {EnqueueJob{Queue: "default", Type: strings.Repeat("t", 65)}, "raptor: job type must be 1-64 characters"},
+		"key too long":   {EnqueueJob{Queue: "default", Type: "test.job", IdempotencyKey: strings.Repeat("k", 129)}, "raptor: job idempotency key must be at most 128 characters"},
+		"negative TTL":   {EnqueueJob{Queue: "default", Type: "test.job", ClaimTTL: -time.Second}, "raptor: job claim TTL must not be negative"},
+	} {
+		t.Run("Enqueue_Invalid/"+name, func(t *testing.T) {
+			db := beginTx(t, conn)
+
+			_, err := Enqueue(t.Context(), db, tc.job)
+			assert.EqualError(t, err, tc.want)
+
+			var n int
+			require.NoError(t, db.QueryRow(t.Context(), `SELECT count(*) FROM "raptor_jobs"`).Scan(&n))
+			assert.Zero(t, n)
+		})
+	}
+
 	t.Run("Claim", func(t *testing.T) {
 		db := beginTx(t, conn)
 
@@ -147,6 +182,82 @@ func TestRaptor(t *testing.T) {
 				assert.Zero(t, reaped)
 			})
 		}
+	})
+
+	t.Run("Enqueue_ClaimTTL", func(t *testing.T) {
+		for ttl, want := range map[time.Duration]int32{
+			0:                       300,
+			time.Nanosecond:         1,
+			1900 * time.Millisecond: 2,
+			30 * time.Minute:        1800,
+		} {
+			t.Run(ttl.String(), func(t *testing.T) {
+				db := beginTx(t, conn)
+
+				_, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", ClaimTTL: ttl})
+				require.NoError(t, err)
+
+				jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, 0)
+				require.NoError(t, err)
+				require.Len(t, jobs, 1)
+
+				job := jobs[0]
+				assert.Equal(t, want, job.ClaimedTTL)
+				require.NotNil(t, job.ClaimedAt)
+				assert.Equal(t, job.ClaimedAt.Add(time.Duration(want)*time.Second), job.ClaimDeadline())
+			})
+		}
+	})
+
+	t.Run("Enqueue_ClaimTTLOverriddenByClaimTimeout", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		_, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", ClaimTTL: 30 * time.Minute})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "default", "worker-1", 1, time.Minute)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+		assert.Equal(t, int32(60), jobs[0].ClaimedTTL)
+	})
+
+	t.Run("Enqueue_ClaimTTLKeptByIdempotentEnqueue", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		first, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", IdempotencyKey: "k", ClaimTTL: 30 * time.Minute})
+		require.NoError(t, err)
+		second, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", IdempotencyKey: "k", ClaimTTL: time.Minute})
+		require.NoError(t, err)
+		require.Equal(t, first, second)
+
+		var ttl int32
+		require.NoError(t, db.QueryRow(t.Context(), `SELECT "claimed_ttl" FROM "raptor_jobs" WHERE "id" = $1`, first).Scan(&ttl))
+		assert.Equal(t, int32(1800), ttl)
+	})
+
+	t.Run("Sweep_HonorsEnqueuedClaimTTL", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "sweep-ttl", Type: "test.job", ClaimTTL: 30 * time.Minute})
+		require.NoError(t, err)
+
+		jobs, err := Claim(t.Context(), db, "sweep-ttl", "worker-1", 1, 0)
+		require.NoError(t, err)
+		require.Len(t, jobs, 1)
+
+		backdate := func(age string) {
+			t.Helper()
+			_, err := db.Exec(t.Context(), `UPDATE "raptor_jobs" SET "claimed_at" = now() - $2::interval WHERE "id" = $1`, id, age)
+			require.NoError(t, err)
+		}
+
+		backdate("29 minutes")
+		require.NoError(t, Sweep(t.Context(), db, "sweep-ttl"))
+		assert.Equal(t, "claimed", readJobState(t, db, id).Status)
+
+		backdate("30 minutes")
+		require.NoError(t, Sweep(t.Context(), db, "sweep-ttl"))
+		assert.Equal(t, "pending", readJobState(t, db, id).Status)
 	})
 
 	t.Run("Complete", func(t *testing.T) {
@@ -919,6 +1030,15 @@ func TestRaptor(t *testing.T) {
 			assert.ErrorIs(t, Fail(t.Context(), db, job, errors.New("boom")), ErrJobNotFound)
 			assert.ErrorIs(t, Release(t.Context(), db, job), ErrJobNotFound)
 		}
+	})
+
+	t.Run("Settle_NoRow", func(t *testing.T) {
+		db := noRowsDB{DB: beginTx(t, conn)}
+		job := &Job{ID: "00000000-0000-0000-0000-000000000000"}
+
+		assert.ErrorIs(t, Complete(t.Context(), db, job), errSettleNoRow)
+		assert.ErrorIs(t, Fail(t.Context(), db, job, errors.New("boom")), errSettleNoRow)
+		assert.ErrorIs(t, Release(t.Context(), db, job), errSettleNoRow)
 	})
 
 	t.Run("ExecuteJob_Cancelled", func(t *testing.T) {

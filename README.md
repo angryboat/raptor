@@ -25,7 +25,8 @@ if err := raptor.SetupPool(ctx, pool); err != nil {
 ```
 
 Enqueue a job. Pass a `pgx.Tx` instead of the pool to enqueue it in a
-transaction.
+transaction. `Queue` and `Type` must be 1-64 characters and
+`IdempotencyKey` at most 128; `Enqueue` returns an error otherwise.
 
 ```go
 _, err := raptor.Enqueue(ctx, pool, raptor.EnqueueJob{
@@ -50,7 +51,9 @@ return runner.Run(ctx, pool)
 ```
 
 `Run` blocks until `ctx` is cancelled, then finishes the jobs it's already
-running. Each round it takes up to a queue's weight in jobs, starting with the
+running and returns nil, as `SerialRunner.Execute` and `Scheduler.Run` do. A
+`ctx` that passes its deadline, or a failed claim, returns an error. Each
+round it takes up to a queue's weight in jobs, starting with the
 highest-weight queue. It claims a job only when one of its `Threads` workers
 is free to start it, so a claim's deadline never runs out while the job waits
 in line. `Threads` defaults to the number of CPUs, and `Run` returns an error
@@ -72,9 +75,12 @@ the runner to settle jobs after the timeout.
 
 Each job's context ends with its claim, 5 minutes by default, and a job still
 running then can be reaped by `Sweep` and run again elsewhere. Set
-`ClaimTimeout` on either runner to claim for longer than the slowest job. It
-also caps how long a default shutdown waits. The TTL is stored on the job, so a
-runner without `ClaimTimeout` that later claims it keeps the last one set.
+`ClaimTimeout` on either runner to claim for longer than the slowest job, or
+`ClaimTTL` on `EnqueueJob` to give one slow job type a longer claim without
+raising it for the whole runner. Either also caps how long a default shutdown
+waits. `ClaimTimeout` wins over `ClaimTTL`, and the TTL is stored on the job,
+so a runner without `ClaimTimeout` that later claims it, say for a retry,
+keeps the last one set rather than the enqueued `ClaimTTL`.
 
 Call `Quiet` to stop a runner claiming new jobs without stopping the ones it
 has, say from a pre-stop hook while the load balancer drains. Jobs already
@@ -105,7 +111,7 @@ down.
   is pending or claimed, enqueueing another returns the existing job's ID. If
   that job finishes mid-enqueue, the key is free and a new job is enqueued.
 - **Claims**: a worker's context has a deadline at the end of its claim (5
-  minutes by default, or the runner's `ClaimTimeout`). After that, `Sweep` may give the job to another worker.
+  minutes by default, the job's `ClaimTTL`, or the runner's `ClaimTimeout`). After that, `Sweep` may give the job to another worker.
   The original worker's `Complete` or `Fail` then returns `ErrClaimLost`.
   `Complete`, `Fail` and `Release` return `ErrClaimLost` whenever the job
   still exists but the caller's claim no longer holds: it was reaped,
@@ -115,8 +121,9 @@ down.
   `ClaimSeq` from one database-wide sequence, so a `Job` from an earlier
   claim loses even when the same worker reclaims the job after `Release`. Runners log a lost claim at info
   level and move on, so cancelling a running job doesn't surface as an error.
-  Claim TTLs are whole seconds, so `Claim` rounds its timeout up: 500ms claims
-  for one second and 1.5s for two.
+  Claim TTLs are whole seconds, so `Claim` rounds its timeout up, and
+  `ClaimTTL` the same way: 500ms claims for one second and 1.5s for two. A
+  negative `ClaimTTL` is an error.
 
 ## Scheduled jobs
 

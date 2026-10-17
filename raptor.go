@@ -5,9 +5,11 @@ import (
 	"crypto/rand"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"math"
 	"math/big"
 	"time"
+	"unicode/utf8"
 
 	"github.com/angryboat/raptor/internal/migrate"
 	"github.com/jackc/pgx/v5"
@@ -71,6 +73,12 @@ type EnqueueJob struct {
 	ExpiresAt      time.Time
 	MaxAttempts    int32
 	IdempotencyKey string
+	// ClaimTTL is how long a claim on the job lasts before Sweep may reap it
+	// and the worker's context is cancelled, rounded up to whole seconds.
+	// Zero keeps the default of 5 minutes; negative is rejected. A positive
+	// timeout passed to Claim overrides it and replaces it on the job, so
+	// later claims without a timeout, such as retries, keep the override.
+	ClaimTTL time.Duration
 }
 
 type enqueueParams struct {
@@ -82,9 +90,14 @@ type enqueueParams struct {
 	expiresAt      *time.Time
 	maxAttempts    int32
 	idempotencyKey *string
+	claimedTTL     *int32
 }
 
 func newEnqueueParams(job EnqueueJob) (enqueueParams, error) {
+	if err := validateEnqueueJob(job); err != nil {
+		return enqueueParams{}, err
+	}
+
 	payload, err := json.Marshal(job.Payload)
 	if err != nil {
 		return enqueueParams{}, err
@@ -109,17 +122,40 @@ func newEnqueueParams(job EnqueueJob) (enqueueParams, error) {
 	if job.IdempotencyKey != "" {
 		p.idempotencyKey = &job.IdempotencyKey
 	}
+	if job.ClaimTTL > 0 {
+		ttl := ttlSeconds(job.ClaimTTL)
+		p.claimedTTL = &ttl
+	}
 
 	return p, nil
+}
+
+func validateEnqueueJob(job EnqueueJob) error {
+	switch {
+	case !lengthWithin(job.Queue, 1, 64):
+		return errors.New("job queue must be 1-64 characters")
+	case !lengthWithin(job.Type, 1, 64):
+		return errors.New("job type must be 1-64 characters")
+	case !lengthWithin(job.IdempotencyKey, 0, 128):
+		return errors.New("job idempotency key must be at most 128 characters")
+	case job.ClaimTTL < 0:
+		return errors.New("job claim TTL must not be negative")
+	}
+	return nil
+}
+
+func lengthWithin(s string, minLen, maxLen int) bool {
+	n := utf8.RuneCountInString(s)
+	return n >= minLen && n <= maxLen
 }
 
 func Enqueue(ctx context.Context, db DB, job EnqueueJob) (string, error) {
 	p, err := newEnqueueParams(job)
 	if err != nil {
-		return "", err
+		return "", fmt.Errorf("raptor: %w", err)
 	}
 
-	rows, err := db.Query(ctx, `SELECT "raptor_enqueue_job"($1, $2, $3, $4, $5, $6, $7, $8)`,
+	rows, err := db.Query(ctx, `SELECT "raptor_enqueue_job"($1, $2, $3, $4, $5, $6, $7, $8, $9)`,
 		p.queue,
 		p.jobType,
 		p.payload,
@@ -128,6 +164,7 @@ func Enqueue(ctx context.Context, db DB, job EnqueueJob) (string, error) {
 		p.expiresAt,
 		p.maxAttempts,
 		p.idempotencyKey,
+		p.claimedTTL,
 	)
 	if err != nil {
 		return "", enqueueError(err)
@@ -190,6 +227,7 @@ var (
 	ErrClaimLost = errors.New("raptor: job claim lost")
 
 	errEnqueueMissed = errors.New("raptor: enqueue neither inserted a job nor found one holding its idempotency key")
+	errSettleNoRow   = errors.New("raptor: settle returned no row")
 )
 
 // ClaimDeadline is when the job's claim expires and Sweep may hand it to
@@ -339,12 +377,18 @@ func settleClaim(ctx context.Context, db DB, query string, args ...any) error {
 	}
 	defer rows.Close()
 
-	var status string
-	if rows.Next() {
-		if err := rows.Scan(&status); err != nil {
+	if !rows.Next() {
+		if err := rows.Err(); err != nil {
 			return err
 		}
+		return errSettleNoRow
 	}
+
+	var status string
+	if err := rows.Scan(&status); err != nil {
+		return err
+	}
+	rows.Close()
 	if err := rows.Err(); err != nil {
 		return err
 	}

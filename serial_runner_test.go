@@ -176,6 +176,28 @@ func TestSerialRunner(t *testing.T) {
 		assert.Equal(t, claimed.Add(2*time.Hour), deadline)
 	})
 
+	t.Run("Execute_EnqueuedClaimTTLSetsDeadline", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		_, err := Enqueue(t.Context(), db, EnqueueJob{Queue: "default", Type: "test.job", ClaimTTL: 30 * time.Minute})
+		require.NoError(t, err)
+
+		var (
+			deadline time.Time
+			claimed  time.Time
+		)
+		worker := ValueWorkerFunc(func(ctx context.Context, job *Job, _ any) error {
+			deadline, _ = ctx.Deadline()
+			claimed = *job.ClaimedAt
+			return nil
+		})
+		r := NewSerialRunner([]string{"default"}, map[string]Worker{"test.job": worker})
+
+		require.NoError(t, r.Execute(t.Context(), db))
+
+		assert.Equal(t, claimed.Add(30*time.Minute), deadline)
+	})
+
 	t.Run("Execute_NegativeClaimTimeout", func(t *testing.T) {
 		db := beginTx(t, conn)
 
@@ -212,7 +234,7 @@ func TestSerialRunner(t *testing.T) {
 		}
 
 		close(worker.unblock)
-		require.ErrorIs(t, <-done, context.Canceled)
+		require.NoError(t, <-done)
 
 		for _, id := range ids {
 			want := jobState{Status: "pending", Attempts: 0}
@@ -289,7 +311,7 @@ func TestSerialRunner(t *testing.T) {
 
 		select {
 		case err := <-done:
-			require.ErrorIs(t, err, context.Canceled)
+			require.NoError(t, err)
 		case <-time.After(3 * time.Second):
 			t.Fatal("Execute never returned after the shutdown timeout")
 		}
@@ -333,5 +355,50 @@ func TestSerialRunner(t *testing.T) {
 
 		err := r.Execute(t.Context(), db)
 		assert.NoError(t, err)
+	})
+
+	t.Run("Execute_CancelledBeforeStart", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		enqueueN(t, db, "default", 1)
+
+		r := NewSerialRunner([]string{"default"}, map[string]Worker{"test.job": &recordingWorker{}})
+
+		ctx, cancel := context.WithCancelCause(t.Context())
+		cancel(errors.New("shutting down"))
+
+		assert.NoError(t, r.Execute(ctx, db))
+		assert.Zero(t, countClaimed(t, db, "default"))
+	})
+
+	t.Run("Execute_DeadlineExceeded", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		enqueueN(t, db, "default", 1)
+
+		r := NewSerialRunner([]string{"default"}, map[string]Worker{"test.job": &recordingWorker{}})
+
+		ctx, cancel := context.WithDeadline(t.Context(), time.Now().Add(-time.Second))
+		defer cancel()
+
+		assert.ErrorIs(t, r.Execute(ctx, db), context.DeadlineExceeded)
+	})
+}
+
+func TestSerialRunner_Execute_ClaimError(t *testing.T) {
+	t.Run("ReturnsClaimError", func(t *testing.T) {
+		want := errors.New("db is down")
+
+		r := NewSerialRunner([]string{"default"}, nil)
+
+		assert.ErrorIs(t, r.Execute(t.Context(), failingDB{err: want}), want)
+	})
+
+	t.Run("ReturnsClaimErrorWrappingCanceled", func(t *testing.T) {
+		want := fmt.Errorf("claim: %w", context.Canceled)
+
+		r := NewSerialRunner([]string{"default"}, nil)
+
+		assert.ErrorIs(t, r.Execute(t.Context(), failingDB{err: want}), want)
 	})
 }

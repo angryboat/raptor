@@ -192,6 +192,14 @@ func (d failingDB) Query(context.Context, string, ...any) (pgx.Rows, error) {
 	return nil, d.err
 }
 
+type noRowsDB struct {
+	DB
+}
+
+func (d noRowsDB) Query(ctx context.Context, _ string, _ ...any) (pgx.Rows, error) {
+	return d.DB.Query(ctx, `SELECT 'COMPLETED' WHERE false`)
+}
+
 type cancelAfterFirstClaimDB struct {
 	DB
 	cancel  context.CancelFunc
