@@ -64,5 +64,5 @@ jobs:
       - uses: actions/setup-go@v7
         with:
           go-version-file: go.mod
-      - run: go install go.uber.org/nilaway/cmd/nilaway@latest
+      - run: go install go.uber.org/nilaway/cmd/nilaway@v0.0.0-20260918162853-acb8859b9031
       - run: nilaway ./...
