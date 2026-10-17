@@ -9,7 +9,6 @@ import (
 	"runtime"
 	"slices"
 	"sync"
-	"sync/atomic"
 	"time"
 )
 
@@ -31,7 +30,7 @@ type ConcurrentWeightedRunner struct {
 
 	emptyCooldown time.Duration
 	id            string
-	quiet         atomic.Bool
+	quiet         quietSignal
 }
 
 func NewConcurrentWeightedRunner(queue map[string]int, workers map[string]Worker) *ConcurrentWeightedRunner {
@@ -44,8 +43,15 @@ func NewConcurrentWeightedRunner(queue map[string]int, workers map[string]Worker
 	}
 }
 
+// Quiet stops Run from claiming new jobs. Jobs already claimed, including
+// those from a claim in progress when Quiet is called, still run and settle.
+// Run keeps blocking until its context is done, so a process can quiet its
+// runner ahead of shutdown and cancel the context once in-flight jobs finish.
+// Quiet is permanent: a quieted runner never claims again, even from a later
+// Run. It is safe to call more than once, before Run starts, and concurrently
+// with Run.
 func (c *ConcurrentWeightedRunner) Quiet() {
-	c.quiet.Store(true)
+	c.quiet.quiet()
 }
 
 func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
@@ -68,7 +74,7 @@ func (c *ConcurrentWeightedRunner) Run(parent context.Context, db DB) error {
 
 	go func() {
 		defer close(jobs)
-		for ctx.Err() == nil && !c.quiet.Load() {
+		for ctx.Err() == nil && !c.quiet.quieted() {
 			if err := c.dequeue(ctx, db, queues, idle, jobs); err != nil {
 				cancel(err)
 				return
@@ -139,6 +145,7 @@ func (c *ConcurrentWeightedRunner) dequeue(ctx context.Context, db DB, queues []
 	if !claimedAny {
 		select {
 		case <-ctx.Done():
+		case <-c.quiet.done():
 		case <-time.After(c.emptyCooldown):
 		}
 	}
@@ -158,9 +165,13 @@ func (c *ConcurrentWeightedRunner) drainQueue(ctx context.Context, db DB, name s
 			return claimed, err
 		}
 
-		limit := idle.take(ctx, max-claimed)
+		limit := idle.take(ctx, c.quiet.done(), max-claimed)
 		if limit == 0 {
 			return claimed, ctx.Err()
+		}
+		if c.quiet.quieted() {
+			idle.put(limit)
+			return claimed, nil
 		}
 
 		jobs, err := Claim(ctx, db, name, c.id, limit, 0)
@@ -194,9 +205,11 @@ func newIdleWorkers(n int) idleWorkers {
 	return idle
 }
 
-func (w idleWorkers) take(ctx context.Context, max int) int {
+func (w idleWorkers) take(ctx context.Context, stop <-chan struct{}, max int) int {
 	select {
 	case <-ctx.Done():
+		return 0
+	case <-stop:
 		return 0
 	case <-w:
 	}
@@ -238,6 +251,31 @@ func (c *ConcurrentWeightedRunner) release(ctx context.Context, db DB, jobs ...*
 }
 
 const settleTimeout = 10 * time.Second
+
+type quietSignal struct {
+	init sync.Once
+	stop sync.Once
+	ch   chan struct{}
+}
+
+func (q *quietSignal) done() <-chan struct{} {
+	q.init.Do(func() { q.ch = make(chan struct{}) })
+	return q.ch
+}
+
+func (q *quietSignal) quiet() {
+	q.done()
+	q.stop.Do(func() { close(q.ch) })
+}
+
+func (q *quietSignal) quieted() bool {
+	select {
+	case <-q.done():
+		return true
+	default:
+		return false
+	}
+}
 
 func validateShutdownTimeout(timeout time.Duration) error {
 	if timeout < 0 {
