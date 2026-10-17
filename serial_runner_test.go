@@ -186,6 +186,50 @@ func TestSerialRunner(t *testing.T) {
 		}
 	})
 
+	t.Run("Execute_QuietFinishesRunningJobAndReturns", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		ids := enqueueN(t, db, "default", 2)
+
+		worker := newBlockingWorker()
+		r := NewSerialRunner([]string{"default", "other"}, map[string]Worker{"test.job": worker})
+		enqueueN(t, db, "other", 1)
+
+		done := make(chan error, 1)
+		go func() { done <- r.Execute(t.Context(), db) }()
+
+		started := worker.awaitStart(t)
+		r.Quiet()
+		r.Quiet()
+		close(worker.unblock)
+		require.NoError(t, <-done)
+
+		assert.Empty(t, worker.started, "runner started a job after Quiet")
+		assert.Zero(t, countClaimed(t, db, "other"))
+		for _, id := range ids {
+			want := jobState{Status: "pending", Attempts: 0}
+			if id == started.ID {
+				want = jobState{Status: "completed", Attempts: 1}
+			}
+			assert.Equal(t, want, readJobState(t, db, id), "job %s", id)
+		}
+	})
+
+	t.Run("Execute_QuietBeforeExecuteClaimsNothing", func(t *testing.T) {
+		db := beginTx(t, conn)
+
+		id := enqueueN(t, db, "default", 1)[0]
+
+		worker := &recordingWorker{}
+		r := NewSerialRunner([]string{"default"}, map[string]Worker{"test.job": worker})
+		r.Quiet()
+
+		require.NoError(t, r.Execute(t.Context(), db))
+
+		assert.Empty(t, worker.ids())
+		assert.Equal(t, jobState{Status: "pending", Attempts: 0}, readJobState(t, db, id))
+	})
+
 	t.Run("Execute_ShutdownTimeoutReleasesRunningJob", func(t *testing.T) {
 		const timeout = 100 * time.Millisecond
 		db := beginTx(t, conn)

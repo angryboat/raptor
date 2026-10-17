@@ -16,7 +16,8 @@ type SerialRunner struct {
 	// ConcurrentWeightedRunner.
 	ShutdownTimeout time.Duration
 
-	id string
+	id    string
+	quiet quietSignal
 }
 
 func NewSerialRunner(queue []string, workers map[string]Worker) *SerialRunner {
@@ -25,6 +26,15 @@ func NewSerialRunner(queue []string, workers map[string]Worker) *SerialRunner {
 		Workers: workers,
 		id:      newRunnerID(),
 	}
+}
+
+// Quiet stops Execute from claiming new jobs. The job already running
+// finishes and settles, then Execute returns nil, as if its queues were empty.
+// Quiet is permanent: a quieted runner never claims again, even from a later
+// Execute. It is safe to call more than once, before Execute starts, and
+// concurrently with Execute.
+func (r *SerialRunner) Quiet() {
+	r.quiet.quiet()
 }
 
 // Execute drains each queue in Queue, in slice order: a queue is claimed
@@ -50,6 +60,9 @@ func (r *SerialRunner) drainQueue(ctx, jobCtx context.Context, db DB, queue stri
 	for {
 		if err := ctx.Err(); err != nil {
 			return err
+		}
+		if r.quiet.quieted() {
+			return nil
 		}
 
 		jobs, err := Claim(ctx, db, queue, r.id, 1, 0)
